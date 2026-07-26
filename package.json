@@ -1,0 +1,21 @@
+{
+  "name": "gridsync-os",
+  "version": "0.1.0",
+  "description": "GridSync-OS: Distributed Energy Resource (DER) Orchestration middleware. Protocol-agnostic ingestion, deterministic constraint validation, and crash-safe command delivery for inverters, meters, and storage assets.",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test test/selftest.js",
+    "selftest": "node --test test/selftest.js",
+    "selftest:verbose": "node --test --test-reporter=spec test/selftest.js"
+  },
+  "dependencies": {
+    "mqtt": "^5.10.1"
+  },
+  "author": "Syed Ali Hasan Moosavi / SAYANJALI NEXUS PRIVATE LIMITED",
+  "license": "UNLICENSED"
+}
