@@ -22,6 +22,7 @@ const { AdapterBase } = require('../src/adapters/AdapterBase');
 const { MqttAdapter } = require('../src/adapters/MqttAdapter');
 const { GridSyncOrchestrator } = require('../src/orchestrator/GridSyncOrchestrator');
 const { ValidationError } = require('../src/utils/errors');
+const { Router } = require('../src/api/Router');
 
 const quietLogger = new Logger('selftest', 'error'); // suppress info/debug noise in test output
 
@@ -40,7 +41,8 @@ async function rmTempDir(dir) {
 async function waitUntil(predicate, timeoutMs = 2000, intervalMs = 10) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    if (predicate()) return true;
+    // eslint-disable-next-line no-await-in-loop
+    if (await predicate()) return true;
     // eslint-disable-next-line no-await-in-loop
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
@@ -56,6 +58,12 @@ function makeTestConfig(dataDir, overrides = {}) {
   cfg.commandQueue.maxRetryDelayMs = overrides.maxRetryDelayMs ?? 100;
   cfg.commandQueue.maxAttempts = overrides.maxAttempts ?? cfg.commandQueue.maxAttempts;
   cfg.circuitBreaker.staleTelemetryMs = overrides.staleTelemetryMs ?? cfg.circuitBreaker.staleTelemetryMs;
+  // Orchestrator tests don't need a real network listener, and running one
+  // by default risks port collisions with an actual GridSync-OS instance on
+  // the same machine. Dedicated API tests opt back in with port 0 (OS-assigned).
+  cfg.api.enabled = overrides.apiEnabled ?? false;
+  if (overrides.apiPort !== undefined) cfg.api.port = overrides.apiPort;
+  if (overrides.apiToken !== undefined) cfg.api.token = overrides.apiToken;
   return cfg;
 }
 
@@ -701,6 +709,233 @@ test('MqttAdapter: gives up after maxReconnectAttempts and disconnect() afterwar
   // after give-up must not attempt a second .end() on the same client.
   await assert.doesNotReject(() => adapter.disconnect());
   assert.equal(fakeClient.endCallCount, 1, 'disconnect() after give-up must not call .end() again');
+});
+
+// ---------------------------------------------------------------------------
+// Router: path matching + :param extraction, tested independent of HTTP
+// ---------------------------------------------------------------------------
+
+test('Router: matches a static route and rejects wrong method', () => {
+  const r = new Router();
+  r.get('/health', () => 'ok');
+  const match = r.match('GET', '/health');
+  assert.ok(match);
+  assert.equal(match.handler(), 'ok');
+  assert.equal(r.match('POST', '/health'), null);
+});
+
+test('Router: extracts :param segments and URL-decodes them', () => {
+  const r = new Router();
+  r.get('/api/devices/:deviceId/telemetry', () => {});
+  const match = r.match('GET', '/api/devices/inv%2001/telemetry');
+  assert.ok(match);
+  assert.equal(match.params.deviceId, 'inv 01');
+});
+
+test('Router: returns null for a path that matches no route', () => {
+  const r = new Router();
+  r.get('/health', () => {});
+  assert.equal(r.match('GET', '/nope'), null);
+});
+
+// ---------------------------------------------------------------------------
+// ApiServer: full end-to-end HTTP tests against a real server on an
+// OS-assigned ephemeral port (port 0) -- zero collision risk with any other
+// GridSync-OS instance or other tests running concurrently.
+// ---------------------------------------------------------------------------
+
+async function buildApiHarness(dataDir, { token } = {}) {
+  const cfg = makeTestConfig(dataDir, { apiEnabled: true, apiPort: 0, apiToken: token });
+  const orchestrator = new GridSyncOrchestrator({ config: cfg, logger: quietLogger });
+  const fakeAdapter = new FakeAdapter(quietLogger);
+  orchestrator.registerAdapter('fake', fakeAdapter);
+  await orchestrator.start();
+  const port = orchestrator.apiServer.server.address().port;
+  const base = `http://127.0.0.1:${port}`;
+  return { orchestrator, fakeAdapter, base };
+}
+
+test('ApiServer: GET /health responds ok', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const h = await buildApiHarness(dataDir);
+    const res = await fetch(`${h.base}/health`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.status, 'ok');
+    await h.orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('ApiServer: /api/devices reflects real telemetry flowing through the orchestrator', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const h = await buildApiHarness(dataDir);
+
+    let res = await fetch(`${h.base}/api/devices`);
+    assert.equal((await res.json()).devices.length, 0);
+
+    h.fakeAdapter.emitTelemetry(
+      { deviceId: 'api-inv-01', deviceType: 'INVERTER', voltage: 230, frequency: 50, soc: 0.5, timestamp: Date.now() },
+      { protocol: 'MQTT', deviceId: 'api-inv-01' },
+    );
+    await waitUntil(async () => {
+      res = await fetch(`${h.base}/api/devices`);
+      const body = await res.json();
+      return body.devices.length === 1;
+    }, 2000);
+
+    const body = await (await fetch(`${h.base}/api/devices`)).json();
+    assert.equal(body.devices[0].deviceId, 'api-inv-01');
+    assert.equal(body.devices[0].mode, 'NORMAL');
+
+    await h.orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('ApiServer: GET /api/devices/:deviceId returns 404 for an unknown device, 200 for a known one', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const h = await buildApiHarness(dataDir);
+
+    const notFound = await fetch(`${h.base}/api/devices/does-not-exist`);
+    assert.equal(notFound.status, 404);
+
+    h.fakeAdapter.emitTelemetry(
+      { deviceId: 'api-inv-02', deviceType: 'INVERTER', voltage: 230, frequency: 50, soc: 0.5, timestamp: Date.now() },
+      { protocol: 'MQTT', deviceId: 'api-inv-02' },
+    );
+    await waitUntil(async () => (await fetch(`${h.base}/api/devices/api-inv-02`)).status === 200, 2000);
+
+    await h.orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('ApiServer: telemetry history endpoint returns ingested points and respects limit', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const h = await buildApiHarness(dataDir);
+    for (let i = 0; i < 5; i += 1) {
+      h.fakeAdapter.emitTelemetry(
+        { deviceId: 'api-hist-01', deviceType: 'METER', voltage: 225 + i, timestamp: Date.now() + i },
+        { protocol: 'MQTT', deviceId: 'api-hist-01' },
+      );
+    }
+    await waitUntil(async () => {
+      const res = await fetch(`${h.base}/api/devices/api-hist-01/telemetry`);
+      const body = await res.json();
+      return body.count === 5;
+    }, 2000);
+
+    const limited = await (await fetch(`${h.base}/api/devices/api-hist-01/telemetry?limit=2`)).json();
+    assert.equal(limited.count, 2);
+    // Newest-first ordering.
+    assert.ok(limited.points[0].metrics.voltage > limited.points[1].metrics.voltage);
+
+    await h.orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('ApiServer: POST /api/commands fails closed (503) when no token is configured', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const h = await buildApiHarness(dataDir); // no token passed
+    const res = await fetch(`${h.base}/api/commands`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'STANDBY', deviceId: 'x', value: 0 }),
+    });
+    assert.equal(res.status, 503);
+    await h.orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('ApiServer: POST /api/commands rejects a wrong/missing token (401), accepts the correct one (202) and actually enqueues it', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const h = await buildApiHarness(dataDir, { token: 'secret-token-123' });
+
+    // A manual command can only be routed once the target device has been
+    // seen by an adapter at least once -- this is correct system behavior
+    // (we can't route to a device with no known transport), so establish
+    // that via telemetry first, same as a real operator workflow would.
+    h.fakeAdapter.emitTelemetry(
+      { deviceId: 'api-cmd-01', deviceType: 'INVERTER', voltage: 230, frequency: 50, soc: 0.5, timestamp: Date.now() },
+      { protocol: 'MQTT', deviceId: 'api-cmd-01' },
+    );
+    await waitUntil(() => h.orchestrator.getDeviceDetail('api-cmd-01') !== null, 2000);
+
+    const wrongToken = await fetch(`${h.base}/api/commands`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer nope' },
+      body: JSON.stringify({ type: 'CURTAIL', deviceId: 'api-cmd-01', value: 10 }),
+    });
+    assert.equal(wrongToken.status, 401);
+
+    const ok = await fetch(`${h.base}/api/commands`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer secret-token-123' },
+      body: JSON.stringify({ type: 'CURTAIL', deviceId: 'api-cmd-01', value: 10 }),
+    });
+    assert.equal(ok.status, 202);
+    const okBody = await ok.json();
+    assert.ok(okBody.commandId);
+
+    await waitUntil(() => h.fakeAdapter.sentCommands.some((c) => c.deviceId === 'api-cmd-01'), 2000);
+
+    await h.orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('ApiServer: malformed JSON body returns 400, oversized body returns 413', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const h = await buildApiHarness(dataDir, { token: 'tok' });
+
+    const malformed = await fetch(`${h.base}/api/commands`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok' },
+      body: '{not valid json',
+    });
+    assert.equal(malformed.status, 400);
+
+    const maxBodyBytes = h.orchestrator.config.api.maxBodyBytes;
+    const oversized = 'x'.repeat(maxBodyBytes + 1000);
+    const tooLarge = await fetch(`${h.base}/api/commands`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok' },
+      body: oversized,
+    });
+    assert.equal(tooLarge.status, 413);
+
+    await h.orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('ApiServer: unknown route returns 404', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const h = await buildApiHarness(dataDir);
+    const res = await fetch(`${h.base}/nope/not/a/route`);
+    assert.equal(res.status, 404);
+    await h.orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
 });
 
 // ---------------------------------------------------------------------------

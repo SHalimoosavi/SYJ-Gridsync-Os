@@ -41,6 +41,27 @@ class StorageAdapter {
     throw new Error('StorageAdapter.loadPendingCommands() not implemented');
   }
 
+  /**
+   * Returns the most recent telemetry points for a device, newest first,
+   * capped at `limit`. Used by the monitoring dashboard/API -- not on any
+   * ingestion hot path.
+   * @returns {Promise<object[]>}
+   */
+  // eslint-disable-next-line class-methods-use-this, no-unused-vars
+  async queryTelemetry(_deviceId, _limit) {
+    throw new Error('StorageAdapter.queryTelemetry() not implemented');
+  }
+
+  /**
+   * Returns the most recent command records (one per commandId, latest
+   * known status), newest first, capped at `limit`.
+   * @returns {Promise<object[]>}
+   */
+  // eslint-disable-next-line class-methods-use-this, no-unused-vars
+  async queryCommandHistory(_limit) {
+    throw new Error('StorageAdapter.queryCommandHistory() not implemented');
+  }
+
   // eslint-disable-next-line class-methods-use-this
   async close() {
     throw new Error('StorageAdapter.close() not implemented');

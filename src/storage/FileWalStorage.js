@@ -4,7 +4,7 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 const { StorageAdapter } = require('./StorageAdapter');
 const { StorageError } = require('../utils/errors');
-const { assertPlainObject } = require('../utils/validation');
+const { assertPlainObject, assertNonEmptyString } = require('../utils/validation');
 
 /**
  * FileWalStorage: append-only JSONL files, zero external dependencies.
@@ -86,6 +86,37 @@ class FileWalStorage extends StorageAdapter {
   async loadPendingCommands() {
     const latest = await this._readLatestCommandStates();
     return Object.values(latest).filter((r) => r.status !== 'ACKED' && r.status !== 'FAILED');
+  }
+
+  async queryTelemetry(deviceId, limit) {
+    assertNonEmptyString(deviceId, 'deviceId');
+    let content;
+    try {
+      content = await fsp.readFile(this.telemetryFile, 'utf8');
+    } catch (err) {
+      if (err.code === 'ENOENT') return [];
+      throw new StorageError('Failed to read telemetry log', { cause: err.message });
+    }
+    const matches = [];
+    for (const line of content.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const point = JSON.parse(line);
+        if (point.deviceId === deviceId) matches.push(point);
+      } catch {
+        // A single corrupted line must never break a query -- skip and continue.
+        if (this.logger) this.logger.warn('skipping corrupt telemetry line during query');
+      }
+    }
+    // File is append-only chronological -- the tail is the most recent.
+    return matches.slice(-limit).reverse();
+  }
+
+  async queryCommandHistory(limit) {
+    const latest = await this._readLatestCommandStates();
+    const all = Object.values(latest);
+    all.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    return all.slice(0, limit);
   }
 
   async _readLatestCommandStates() {

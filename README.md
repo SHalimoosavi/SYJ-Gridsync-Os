@@ -12,9 +12,10 @@
 
 ![Node.js](https://img.shields.io/badge/Node.js-%E2%89%A518-green?logo=node.js&logoColor=white)
 ![License](https://img.shields.io/badge/License-Proprietary-blue)
-![Tests](https://img.shields.io/badge/Self--Tests-33%20Passing-success?logo=checkmarx&logoColor=white)
+![Tests](https://img.shields.io/badge/Self--Tests-44%20Passing-success?logo=checkmarx&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Termux%20%7C%20Linux%20%7C%20Windows-orange)
 ![MQTT](https://img.shields.io/badge/MQTT-Supported-660066?logo=mqtt&logoColor=white)
+![API](https://img.shields.io/badge/REST%20API-Dashboard%20%2B%20Endpoints-informational)
 ![Industrial](https://img.shields.io/badge/Industrial-IIoT-red)
 ![Dependencies](https://img.shields.io/badge/Native%20Deps-Zero-blueviolet)
 
@@ -32,6 +33,7 @@
 - [Architecture at a Glance](#architecture-at-a-glance)
 - [Device State Machine](#device-state-machine)
 - [Command Lifecycle & Crash Recovery](#command-lifecycle--crash-recovery)
+- [REST API & Monitoring Dashboard](#rest-api--monitoring-dashboard)
 - [Project Structure](#project-structure)
 - [Getting Started (Termux)](#getting-started-termux)
 - [Initializing Your Own Git Repository](#initializing-your-own-git-repository)
@@ -174,7 +176,56 @@ sequenceDiagram
 
 ---
 
-## Project Structure
+## REST API & Monitoring Dashboard
+
+A zero-dependency HTTP API (Node's built-in `http` module, no Express/framework) plus a single-file monitoring dashboard, both served by the same process as the orchestrator -- no separate service to run.
+
+```bash
+npm start
+# → Dashboard available at http://127.0.0.1:8787/
+```
+
+Open that URL in a browser for a live view of device fleet status (voltage/frequency/SoC per device, color-coded by mode), pending commands, and recent command history, auto-refreshing every 3 seconds.
+
+### Endpoints
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| GET | `/health` | none | Liveness check |
+| GET | `/` , `/dashboard` | none | Monitoring dashboard (HTML) |
+| GET | `/api/snapshot` | none | Full system snapshot (ingestion metrics, circuit breaker status, pending count, device modes) |
+| GET | `/api/devices` | none | All known devices with current mode + latest telemetry |
+| GET | `/api/devices/:deviceId` | none | Detail for one device (404 if never seen) |
+| GET | `/api/devices/:deviceId/telemetry?limit=N` | none | Recent telemetry history, newest first (default 50, max 500) |
+| GET | `/api/commands/pending` | none | Currently live (non-terminal) commands |
+| GET | `/api/commands/history?limit=N` | none | Recent command history regardless of outcome (default 50, max 500) |
+| POST | `/api/commands` | **token required** | Issue a manual command: `{"type": "CURTAIL", "deviceId": "...", "value": 10, "reason": "..."}` |
+
+### Security posture
+
+This API can issue grid-control commands, so the defaults are deliberately conservative:
+
+- **Binds to `127.0.0.1` only by default** (`GS_API_HOST`) -- not reachable from your local network unless you explicitly widen it, and even then you should put it behind a VPN or reverse proxy with auth.
+- **`POST /api/commands` fails closed.** If `GS_API_TOKEN` isn't set, the endpoint returns `503` rather than silently accepting unauthenticated commands. Once set, requests need `Authorization: Bearer <token>`; a missing/wrong token gets `401`.
+- **Request bodies are size-capped** (`GS_API_MAX_BODY_BYTES`, default 64KB) so a single client can't exhaust memory with an oversized payload.
+- Read-only GET endpoints have no auth by default (they're visibility, not control) -- if telemetry itself is sensitive for your deployment, put the whole thing behind a reverse proxy.
+
+```bash
+# Enable command issuance:
+GS_API_TOKEN=your-secret-here npm start
+
+# Issue a manual command:
+curl -X POST http://127.0.0.1:8787/api/commands \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-secret-here" \
+  -d '{"type":"CURTAIL","deviceId":"inverter-01","value":20,"reason":"manual test"}'
+```
+
+### Design note
+
+The dashboard is a single static HTML file (`src/api/dashboard.html`) with inline CSS/JS -- no build step, no framework, and deliberately **no external font or CDN calls**, since a grid-monitoring tool needs to keep working with zero connectivity. Its visual language is drawn from substation control panels / SCADA HMIs rather than a generic web-dashboard template: the three status colors map directly to the state machine's actual `NORMAL`/`CURTAILED`/`ALERT` modes, and each device row's status indicator only animates (a soft pulse, like a physical panel lamp) when it's in a state that needs attention -- steady means "all clear," motion means "look here."
+
+
 
 <details>
 <summary><b>Click to expand full file tree</b></summary>
@@ -214,10 +265,14 @@ gridsync-os/
 │   │   ├── StorageAdapter.js          # storage interface
 │   │   ├── FileWalStorage.js          # default backend: dependency-free JSONL WAL
 │   │   └── SqliteStorage.js           # optional backend: node:sqlite (feature-detected)
+│   ├── api/
+│   │   ├── Router.js                  # minimal dependency-free HTTP router (:param support)
+│   │   ├── ApiServer.js               # REST API -- zero deps, localhost-bound, fail-closed auth
+│   │   └── dashboard.html             # single-file monitoring dashboard (no build step)
 │   └── orchestrator/
 │       └── GridSyncOrchestrator.js    # composition root -- wires everything together
 └── test/
-    └── selftest.js             # 33 tests: unit + simulated end-to-end scenarios
+    └── selftest.js             # 44 tests: unit + simulated end-to-end scenarios
 ```
 
 </details>
@@ -231,7 +286,7 @@ pkg update && pkg install nodejs git -y
 git clone <your-repo-url> gridsync-os   # or unzip the delivered archive
 cd gridsync-os
 npm install          # pure-JS deps only, no compilation step
-npm test             # run the full self-test suite (33 tests)
+npm test             # run the full self-test suite (44 tests)
 npm start             # boot the orchestrator (MQTT + simulated Modbus/DNP3)
 ```
 
@@ -273,6 +328,11 @@ Everything tunable lives in `src/config.js` and is overridable via environment v
 | `GS_DATA_DIR` | `./data` | Where WAL/telemetry files live |
 | `GS_MQTT_URL` | `mqtt://localhost:1883` | Broker address |
 | `GS_MQTT_MAX_RECONNECT_ATTEMPTS` | 0 (unlimited) | Give up reconnecting after N failed attempts instead of retrying forever |
+| `GS_API_ENABLED` | `true` | Set to `false` to disable the REST API/dashboard entirely |
+| `GS_API_HOST` | `127.0.0.1` | API bind address -- deliberately localhost-only by default |
+| `GS_API_PORT` | 8787 | API/dashboard port |
+| `GS_API_TOKEN` | unset | Required for `POST /api/commands`; unset means that endpoint fails closed (503) |
+| `GS_API_MAX_BODY_BYTES` | 65536 | Max request body size for POST endpoints |
 
 Grid safety limits (voltage/frequency/SoC bounds, max curtail/charge/discharge kW) are in `src/config.js` under `gridConstraints` — these are illustrative LV-distribution defaults (230V ±10%, 50Hz ±0.5) and **must be reviewed against your actual grid code and asset ratings before any real deployment.**
 
@@ -285,6 +345,7 @@ Grid safety limits (voltage/frequency/SoC bounds, max curtail/charge/discharge k
 - **Modbus / DNP3**: both adapters ship in simulated mode. `ModbusAdapter` documents the path to real TCP polling (e.g. via `jsmodbus`); `Dnp3Adapter` documents why DNP3 in production almost always sits behind a dedicated protocol gateway that republishes over MQTT, which `MqttAdapter` already handles. Both keep the exact same downstream contract, so nothing else changes.
 - **TimescaleDB**: implement a `TimescaleStorage.js` against the same `StorageAdapter` interface as `FileWalStorage`/`SqliteStorage` (Postgres via `pg`, batched inserts). Swap it in via `GS_STORAGE_DRIVER`.
 - **Grid constraints**: replace the illustrative values in `config.js` with your actual interconnection agreement / grid code limits.
+- **REST API exposure**: if you need the dashboard/API reachable beyond localhost, put it behind a reverse proxy or VPN with its own auth layer rather than widening `GS_API_HOST` directly -- the built-in token check is a floor, not a substitute for real network-level access control in production.
 
 ---
 
@@ -294,7 +355,7 @@ Grid safety limits (voltage/frequency/SoC bounds, max curtail/charge/discharge k
 npm test
 ```
 
-33 tests covering:
+44 tests covering:
 
 - ✅ Pure-function correctness of the state machine (deterministic transitions, auto-curtailment on overvoltage, release on recovery)
 - ✅ Constraint validation (clamping over-limit commands, rejecting unsafe discharge/charge based on SoC, fail-closed on unknown state)
@@ -305,6 +366,7 @@ npm test
 - ✅ Malformed-input resilience (bad payloads are discarded without disrupting subsequent valid points)
 - ✅ A 5,000-point high-velocity burst processed without throwing or hanging
 - ✅ MQTT reconnect-failure log throttling (1st failure logs full detail, every 10th logs a concise summary, counter resets on reconnect) and safe give-up after `GS_MQTT_MAX_RECONNECT_ATTEMPTS` (including a regression test for a double-`.end()` bug found and fixed during review)
+- ✅ REST API routing (`Router` param extraction/matching) and full end-to-end HTTP tests against a real server on an OS-assigned port: device/telemetry/command endpoints, fail-closed auth (503 with no token, 401 with wrong token, 202 + real dispatch with a correct one), malformed-JSON (400) and oversized-body (413) handling
 - ✅ Full end-to-end: simulated overvoltage telemetry through the whole stack, confirming the resulting command stays within configured safe bounds
 
 <div align="center">

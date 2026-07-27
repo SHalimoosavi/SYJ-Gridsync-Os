@@ -4,7 +4,7 @@ const path = require('node:path');
 const fsp = require('node:fs/promises');
 const { StorageAdapter } = require('./StorageAdapter');
 const { StorageError } = require('../utils/errors');
-const { assertPlainObject } = require('../utils/validation');
+const { assertPlainObject, assertNonEmptyString } = require('../utils/validation');
 
 /**
  * SqliteStorage: uses Node's built-in `node:sqlite` module (no native
@@ -129,6 +129,40 @@ class SqliteStorage extends StorageAdapter {
       return rows.map((r) => JSON.parse(r.payload_json));
     } catch (err) {
       throw new StorageError('SQLite pending-commands query failed', { cause: err.message });
+    }
+  }
+
+  async queryTelemetry(deviceId, limit) {
+    assertNonEmptyString(deviceId, 'deviceId');
+    try {
+      const rows = this.db
+        .prepare('SELECT * FROM telemetry WHERE device_id = ? ORDER BY ts DESC LIMIT ?')
+        .all(deviceId, limit);
+      return rows.map((r) => ({
+        deviceId: r.device_id,
+        protocol: r.protocol,
+        deviceType: r.device_type,
+        timestamp: r.ts,
+        metrics: JSON.parse(r.metrics_json),
+      }));
+    } catch (err) {
+      throw new StorageError('SQLite telemetry query failed', { cause: err.message });
+    }
+  }
+
+  async queryCommandHistory(limit) {
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT ce.* FROM command_events ce
+           INNER JOIN (SELECT command_id, MAX(id) AS max_id FROM command_events GROUP BY command_id) latest
+           ON ce.command_id = latest.command_id AND ce.id = latest.max_id
+           ORDER BY ce.ts DESC LIMIT ?`,
+        )
+        .all(limit);
+      return rows.map((r) => JSON.parse(r.payload_json));
+    } catch (err) {
+      throw new StorageError('SQLite command history query failed', { cause: err.message });
     }
   }
 

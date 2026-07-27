@@ -48,6 +48,11 @@ async function main() {
 
   await orchestrator.start();
 
+  if (orchestrator.apiServer && orchestrator.apiServer.server) {
+    const { host, port } = config.api;
+    logger.info(`Dashboard available at http://${host}:${port}/`);
+  }
+
   const heartbeat = setInterval(() => {
     logger.info('heartbeat', orchestrator.getSnapshot());
   }, 15000);

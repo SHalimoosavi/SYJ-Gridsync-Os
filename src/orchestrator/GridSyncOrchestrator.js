@@ -8,6 +8,7 @@ const { CommandQueue } = require('../commands/CommandQueue');
 const { CommandDispatcher } = require('../commands/CommandDispatcher');
 const { FileWalStorage } = require('../storage/FileWalStorage');
 const { SqliteStorage } = require('../storage/SqliteStorage');
+const { ApiServer } = require('../api/ApiServer');
 const { assertPlainObject, assertNonEmptyString } = require('../utils/validation');
 
 /**
@@ -63,6 +64,10 @@ class GridSyncOrchestrator {
       config,
       logger: this.logger,
     });
+
+    this.apiServer = config.api.enabled
+      ? new ApiServer({ orchestrator: this, config, logger: this.logger })
+      : null;
 
     this._started = false;
   }
@@ -122,6 +127,34 @@ class GridSyncOrchestrator {
     return this.commandQueue.enqueue({ type, deviceId, value, reason: reason || 'MANUAL' });
   }
 
+  /** All known devices with their current FSM mode and latest telemetry -- used by the API/dashboard. */
+  listDevices() {
+    const devices = [];
+    for (const [deviceId, state] of this._deviceStates) {
+      devices.push({
+        deviceId,
+        mode: state.mode,
+        consecutiveViolations: state.consecutiveViolations,
+        lastPoint: this._latestPoints.get(deviceId) || null,
+      });
+    }
+    return devices;
+  }
+
+  /** Full detail for one device, or null if it's never reported telemetry. */
+  getDeviceDetail(deviceId) {
+    const state = this._deviceStates.get(deviceId);
+    if (!state) return null;
+    return {
+      deviceId,
+      mode: state.mode,
+      consecutiveViolations: state.consecutiveViolations,
+      violations: state.violations,
+      lastPoint: this._latestPoints.get(deviceId) || null,
+      adapterId: this._deviceAdapterRouting.get(deviceId) || null,
+    };
+  }
+
   async start() {
     if (this._started) return;
     await this.storage.init();
@@ -137,6 +170,15 @@ class GridSyncOrchestrator {
       });
     }
 
+    if (this.apiServer) {
+      await this.apiServer.start().catch((err) => {
+        // A failed-to-bind API server (e.g. port already in use) is a
+        // visibility problem, not a safety one -- log it and keep running
+        // the actual control loop rather than aborting startup entirely.
+        this.logger.error('API server failed to start (control loop continues without it)', { err });
+      });
+    }
+
     this._started = true;
     this.logger.info('GridSync-OS orchestrator started', {
       adapters: [...this.adapters.keys()],
@@ -147,6 +189,11 @@ class GridSyncOrchestrator {
   async stop() {
     if (!this._started) return;
     this.commandDispatcher.stop();
+    if (this.apiServer) {
+      await this.apiServer.stop().catch((err) => {
+        this.logger.error('API server failed to stop cleanly', { err });
+      });
+    }
     for (const [adapterId, adapter] of this.adapters) {
       // eslint-disable-next-line no-await-in-loop
       await adapter.disconnect().catch((err) => {

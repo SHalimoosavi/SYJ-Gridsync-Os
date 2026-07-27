@@ -45,7 +45,10 @@ class Logger {
     // Never let a logging call itself throw on a weird Error object.
     let safeMeta = meta;
     if (meta && meta.err instanceof Error) {
-      safeMeta = { ...meta, err: { message: meta.err.message, code: meta.err.code, stack: meta.err.stack } };
+      safeMeta = {
+        ...meta,
+        err: { message: meta.err.message, code: meta.err.code, details: meta.err.details, stack: meta.err.stack },
+      };
     }
     this._write('error', msg, safeMeta);
   }

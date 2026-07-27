@@ -53,6 +53,20 @@ module.exports = {
     maxWalLinesBeforeCompaction: num('GS_WAL_MAX_LINES', 5000),
   },
 
+  // -- REST API + monitoring dashboard --
+  api: {
+    enabled: process.env.GS_API_ENABLED !== 'false', // default on; set to 'false' to disable entirely
+    // Binds to localhost only by default -- deliberately not 0.0.0.0, since
+    // this API can issue grid-control commands. Only widen this if you
+    // understand the exposure (e.g. behind a VPN/reverse proxy with auth).
+    host: process.env.GS_API_HOST || '127.0.0.1',
+    port: num('GS_API_PORT', 8787),
+    // If unset, mutating endpoints (POST /api/commands) fail closed with a
+    // clear 503 rather than silently accepting unauthenticated commands.
+    token: process.env.GS_API_TOKEN || null,
+    maxBodyBytes: num('GS_API_MAX_BODY_BYTES', 65536),
+  },
+
   // -- MQTT broker (default ingestion transport) --
   mqtt: {
     url: process.env.GS_MQTT_URL || 'mqtt://localhost:1883',

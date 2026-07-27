@@ -172,6 +172,11 @@ class CommandQueue extends EventEmitter {
     }
   }
 
+  /** Non-destructive snapshot of currently live (non-terminal) commands, for monitoring/API use. */
+  listPending() {
+    return [...this._records.values()].map((r) => ({ ...r }));
+  }
+
   size() {
     return this._pendingOrder.length;
   }
