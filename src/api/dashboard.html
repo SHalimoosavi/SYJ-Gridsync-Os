@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GridSync-OS</title>
+<style>
+  :root {
+    --panel-bg: #0b0f14;
+    --panel-raised: #131a22;
+    --grid-line: #1e2833;
+    --status-normal: #3ddc84;
+    --status-curtailed: #f5a623;
+    --status-alert: #ff4d4d;
+    --status-unknown: #4a5a6a;
+    --text-primary: #e8edf2;
+    --text-dim: #6b7a8a;
+    --accent-signal: #4fc3f7;
+    --mono: ui-monospace, "IBM Plex Mono", "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: -apple-system, "IBM Plex Sans", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--panel-bg);
+    color: var(--text-primary);
+    font-family: var(--mono);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent-signal); }
+
+  .status-strip {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 12px 18px;
+    background: var(--panel-raised);
+    border-bottom: 1px solid var(--grid-line);
+    position: sticky;
+    top: 0;
+    flex-wrap: wrap;
+  }
+
+  .status-strip .title {
+    font-weight: 700;
+    letter-spacing: 0.04em;
+  }
+
+  .status-strip .sep { color: var(--grid-line); }
+
+  .status-strip .stat { color: var(--text-dim); }
+  .status-strip .stat b { color: var(--text-primary); font-weight: 600; }
+
+  .led {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    display: inline-block;
+    background: var(--status-unknown);
+    flex-shrink: 0;
+  }
+
+  .led.normal { background: var(--status-normal); box-shadow: 0 0 6px var(--status-normal); }
+  .led.curtailed { background: var(--status-curtailed); box-shadow: 0 0 8px var(--status-curtailed); animation: pulse 1.6s ease-in-out infinite; }
+  .led.alert { background: var(--status-alert); box-shadow: 0 0 8px var(--status-alert); animation: pulse 1.1s ease-in-out infinite; }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+
+  main { padding: 18px; max-width: 1100px; margin: 0 auto; }
+
+  section { margin-bottom: 28px; }
+
+  h2 {
+    font-family: var(--sans);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin: 0 0 10px 2px;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--panel-raised);
+    border: 1px solid var(--grid-line);
+  }
+
+  th, td {
+    text-align: left;
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--grid-line);
+    white-space: nowrap;
+  }
+
+  th {
+    font-family: var(--sans);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+  }
+
+  tr:last-child td { border-bottom: none; }
+
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--sans);
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .badge.normal { color: var(--status-normal); }
+  .badge.curtailed { color: var(--status-curtailed); }
+  .badge.alert { color: var(--status-alert); }
+
+  .cmd-status {
+    font-family: var(--sans);
+    font-size: 12px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 3px;
+  }
+  .cmd-status.ACKED { color: var(--status-normal); background: rgba(61, 220, 132, 0.12); }
+  .cmd-status.PENDING, .cmd-status.DISPATCHING { color: var(--status-curtailed); background: rgba(245, 166, 35, 0.12); }
+  .cmd-status.FAILED { color: var(--status-alert); background: rgba(255, 77, 77, 0.12); }
+
+  .empty-state {
+    padding: 22px;
+    text-align: center;
+    color: var(--text-dim);
+    font-family: var(--sans);
+    background: var(--panel-raised);
+    border: 1px dashed var(--grid-line);
+  }
+
+  .conn-banner {
+    display: none;
+    padding: 8px 18px;
+    background: var(--status-alert);
+    color: #1a0000;
+    font-family: var(--sans);
+    font-weight: 600;
+    font-size: 13px;
+  }
+  .conn-banner.visible { display: block; }
+
+  footer {
+    text-align: center;
+    color: var(--text-dim);
+    font-family: var(--sans);
+    font-size: 11px;
+    padding: 20px;
+  }
+</style>
+</head>
+<body>
+
+  <div class="conn-banner" id="connBanner">Can't reach GridSync-OS — retrying…</div>
+
+  <div class="status-strip">
+    <span class="title">⚡ GRIDSYNC-OS</span>
+    <span class="sep">·</span>
+    <span class="stat"><b id="deviceCount">–</b> devices</span>
+    <span class="sep">·</span>
+    <span class="stat"><b id="pendingCount">–</b> pending</span>
+    <span class="sep">·</span>
+    <span class="stat"><b id="droppedCount">–</b> dropped</span>
+    <span class="sep">·</span>
+    <span class="stat">updated <b id="lastUpdate">–</b></span>
+  </div>
+
+  <main>
+    <section>
+      <h2>Device Fleet</h2>
+      <table id="deviceTable">
+        <thead>
+          <tr>
+            <th></th>
+            <th>Device</th>
+            <th>Mode</th>
+            <th class="num">Voltage</th>
+            <th class="num">Frequency</th>
+            <th class="num">SoC</th>
+            <th class="num">Power</th>
+            <th>Last Seen</th>
+          </tr>
+        </thead>
+        <tbody id="deviceRows"></tbody>
+      </table>
+      <div class="empty-state" id="deviceEmpty" style="display:none;">No devices have reported telemetry yet.</div>
+    </section>
+
+    <section>
+      <h2>Recent Commands</h2>
+      <table id="commandTable">
+        <thead>
+          <tr>
+            <th>Type</th>
+            <th>Device</th>
+            <th class="num">Value</th>
+            <th>Status</th>
+            <th>Reason</th>
+            <th>Time</th>
+          </tr>
+        </thead>
+        <tbody id="commandRows"></tbody>
+      </table>
+      <div class="empty-state" id="commandEmpty" style="display:none;">No commands issued yet.</div>
+    </section>
+  </main>
+
+  <footer>Auto-refreshing every 3s · <a href="/api/snapshot">raw snapshot</a></footer>
+
+<script>
+(function () {
+  'use strict';
+
+  const REFRESH_MS = 3000;
+  const connBanner = document.getElementById('connBanner');
+
+  function modeClass(mode) {
+    if (mode === 'NORMAL') return 'normal';
+    if (mode === 'CURTAILED') return 'curtailed';
+    if (mode === 'ALERT') return 'alert';
+    return 'unknown';
+  }
+
+  function fmt(value, unit, digits) {
+    if (value === undefined || value === null) return '–';
+    return value.toFixed(digits === undefined ? 1 : digits) + unit;
+  }
+
+  function timeAgo(ts) {
+    if (!ts) return '–';
+    const seconds = Math.max(0, Math.round((Date.now() - ts) / 1000));
+    if (seconds < 60) return seconds + 's ago';
+    if (seconds < 3600) return Math.round(seconds / 60) + 'm ago';
+    return Math.round(seconds / 3600) + 'h ago';
+  }
+
+  function renderDevices(devices) {
+    const tbody = document.getElementById('deviceRows');
+    const empty = document.getElementById('deviceEmpty');
+    if (!devices.length) {
+      tbody.innerHTML = '';
+      empty.style.display = 'block';
+      return;
+    }
+    empty.style.display = 'none';
+    tbody.innerHTML = devices.map(function (d) {
+      const cls = modeClass(d.mode);
+      const m = (d.lastPoint && d.lastPoint.metrics) || {};
+      return '<tr>' +
+        '<td><span class="led ' + cls + '"></span></td>' +
+        '<td>' + escapeHtml(d.deviceId) + '</td>' +
+        '<td><span class="badge ' + cls + '">' + escapeHtml(d.mode) + '</span></td>' +
+        '<td class="num">' + fmt(m.voltage, 'V') + '</td>' +
+        '<td class="num">' + fmt(m.frequency, 'Hz', 2) + '</td>' +
+        '<td class="num">' + (m.soc !== undefined ? Math.round(m.soc * 100) + '%' : '–') + '</td>' +
+        '<td class="num">' + fmt(m.powerKw, 'kW') + '</td>' +
+        '<td>' + timeAgo(d.lastPoint && d.lastPoint.timestamp) + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  function renderCommands(commands) {
+    const tbody = document.getElementById('commandRows');
+    const empty = document.getElementById('commandEmpty');
+    if (!commands.length) {
+      tbody.innerHTML = '';
+      empty.style.display = 'block';
+      return;
+    }
+    empty.style.display = 'none';
+    tbody.innerHTML = commands.map(function (c) {
+      const ts = c.acknowledgedAt || c.createdAt;
+      return '<tr>' +
+        '<td>' + escapeHtml(c.type) + '</td>' +
+        '<td>' + escapeHtml(c.deviceId) + '</td>' +
+        '<td class="num">' + (c.value !== undefined ? c.value : '–') + '</td>' +
+        '<td><span class="cmd-status ' + escapeHtml(c.status) + '">' + escapeHtml(c.status) + '</span></td>' +
+        '<td>' + escapeHtml(c.reason || '–') + '</td>' +
+        '<td>' + (ts ? new Date(ts).toLocaleTimeString() : '–') + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  function escapeHtml(str) {
+    if (str === undefined || str === null) return '';
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  async function refresh() {
+    try {
+      const [snapshotRes, devicesRes, historyRes] = await Promise.all([
+        fetch('/api/snapshot'),
+        fetch('/api/devices'),
+        fetch('/api/commands/history?limit=25'),
+      ]);
+      if (!snapshotRes.ok || !devicesRes.ok || !historyRes.ok) throw new Error('non-OK response');
+
+      const snapshot = await snapshotRes.json();
+      const devicesData = await devicesRes.json();
+      const historyData = await historyRes.json();
+
+      document.getElementById('deviceCount').textContent = devicesData.devices.length;
+      document.getElementById('pendingCount').textContent = snapshot.pendingCommands;
+      document.getElementById('droppedCount').textContent = snapshot.ingestion.dropped;
+      document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+
+      renderDevices(devicesData.devices);
+      renderCommands(historyData.commands);
+
+      connBanner.classList.remove('visible');
+    } catch (err) {
+      connBanner.classList.add('visible');
+    }
+  }
+
+  refresh();
+  setInterval(refresh, REFRESH_MS);
+})();
+</script>
+</body>
+</html>
