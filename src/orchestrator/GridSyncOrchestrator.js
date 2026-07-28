@@ -9,6 +9,7 @@ const { CommandDispatcher } = require('../commands/CommandDispatcher');
 const { FileWalStorage } = require('../storage/FileWalStorage');
 const { SqliteStorage } = require('../storage/SqliteStorage');
 const { ApiServer } = require('../api/ApiServer');
+const { UserStore } = require('../auth/UserStore');
 const { assertPlainObject, assertNonEmptyString } = require('../utils/validation');
 
 /**
@@ -25,6 +26,7 @@ class GridSyncOrchestrator {
     this.logger = logger.child('orchestrator');
 
     this.storage = this._buildStorage();
+    this.userStore = new UserStore({ dataDir: config.storage.dataDir, logger: this.logger });
     this.circuitBreaker = new CircuitBreaker({ ...config.circuitBreaker, logger: this.logger });
     this.constraintValidator = new ConstraintValidator(config.gridConstraints);
     this.stateMachine = new StateMachine(this.constraintValidator);
@@ -66,7 +68,7 @@ class GridSyncOrchestrator {
     });
 
     this.apiServer = config.api.enabled
-      ? new ApiServer({ orchestrator: this, config, logger: this.logger })
+      ? new ApiServer({ orchestrator: this, userStore: this.userStore, config, logger: this.logger })
       : null;
 
     this._started = false;
@@ -122,9 +124,9 @@ class GridSyncOrchestrator {
   }
 
   /** Manually issue a command (e.g. operator-initiated curtailment/discharge), same durability guarantees as auto-generated ones. */
-  async issueManualCommand({ type, deviceId, value, reason }) {
+  async issueManualCommand({ type, deviceId, value, reason, issuedBy }) {
     assertNonEmptyString(deviceId, 'deviceId');
-    return this.commandQueue.enqueue({ type, deviceId, value, reason: reason || 'MANUAL' });
+    return this.commandQueue.enqueue({ type, deviceId, value, reason: reason || 'MANUAL', issuedBy });
   }
 
   /** All known devices with their current FSM mode and latest telemetry -- used by the API/dashboard. */
@@ -155,9 +157,24 @@ class GridSyncOrchestrator {
     };
   }
 
+  async _bootstrapAdminIfConfigured() {
+    const { bootstrapAdminUsername, bootstrapAdminPassword } = this.config.auth;
+    if (!bootstrapAdminUsername || !bootstrapAdminPassword) return;
+    const existingCount = await this.userStore.count();
+    if (existingCount > 0) return; // never auto-create once any account exists
+    try {
+      await this.userStore.createUser({ username: bootstrapAdminUsername, password: bootstrapAdminPassword, role: 'ADMIN' });
+      this.logger.info('bootstrap admin account created', { username: bootstrapAdminUsername.toLowerCase() });
+    } catch (err) {
+      this.logger.error('failed to create bootstrap admin account', { err });
+    }
+  }
+
   async start() {
     if (this._started) return;
     await this.storage.init();
+    await this.userStore.init();
+    await this._bootstrapAdminIfConfigured();
     const recoveredCount = await this.commandQueue.recover();
     this.commandDispatcher.start();
 

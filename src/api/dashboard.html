@@ -166,9 +166,103 @@
     font-size: 11px;
     padding: 20px;
   }
+
+  .login-overlay {
+    position: fixed;
+    inset: 0;
+    background: var(--panel-bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+  }
+  .login-overlay.hidden { display: none; }
+
+  .login-box {
+    background: var(--panel-raised);
+    border: 1px solid var(--grid-line);
+    padding: 28px;
+    width: 100%;
+    max-width: 320px;
+  }
+  .login-box h1 {
+    font-size: 15px;
+    letter-spacing: 0.04em;
+    margin: 0 0 20px 0;
+  }
+  .login-box label {
+    display: block;
+    font-family: var(--sans);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+  }
+  .login-box input {
+    width: 100%;
+    background: var(--panel-bg);
+    border: 1px solid var(--grid-line);
+    color: var(--text-primary);
+    font-family: var(--mono);
+    font-size: 14px;
+    padding: 8px 10px;
+    margin-bottom: 14px;
+  }
+  .login-box input:focus { outline: 1px solid var(--accent-signal); }
+  .login-box button {
+    width: 100%;
+    background: var(--accent-signal);
+    color: #06121a;
+    border: none;
+    font-family: var(--sans);
+    font-weight: 600;
+    font-size: 13px;
+    padding: 10px;
+    cursor: pointer;
+  }
+  .login-box button:hover { opacity: 0.9; }
+  .login-error {
+    color: var(--status-alert);
+    font-family: var(--sans);
+    font-size: 12px;
+    margin: -6px 0 14px 0;
+    min-height: 14px;
+  }
+
+  .user-chip {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .user-chip button {
+    background: none;
+    border: 1px solid var(--grid-line);
+    color: var(--text-dim);
+    font-family: var(--sans);
+    font-size: 11px;
+    padding: 4px 10px;
+    cursor: pointer;
+  }
+  .user-chip button:hover { color: var(--text-primary); border-color: var(--text-dim); }
 </style>
 </head>
 <body>
+
+  <div class="login-overlay" id="loginOverlay">
+    <div class="login-box">
+      <h1>⚡ GRIDSYNC-OS</h1>
+      <form id="loginForm">
+        <label for="loginUsername">Username</label>
+        <input type="text" id="loginUsername" autocomplete="username" required>
+        <label for="loginPassword">Password</label>
+        <input type="password" id="loginPassword" autocomplete="current-password" required>
+        <div class="login-error" id="loginError"></div>
+        <button type="submit">Sign In</button>
+      </form>
+    </div>
+  </div>
 
   <div class="conn-banner" id="connBanner">Can't reach GridSync-OS — retrying…</div>
 
@@ -182,6 +276,10 @@
     <span class="stat"><b id="droppedCount">–</b> dropped</span>
     <span class="sep">·</span>
     <span class="stat">updated <b id="lastUpdate">–</b></span>
+    <span class="user-chip">
+      <span class="stat" id="whoami"></span>
+      <button id="logoutBtn" type="button">Sign out</button>
+    </span>
   </div>
 
   <main>
@@ -231,7 +329,74 @@
   'use strict';
 
   const REFRESH_MS = 3000;
+  const TOKEN_KEY = 'gridsync_token';
   const connBanner = document.getElementById('connBanner');
+  const loginOverlay = document.getElementById('loginOverlay');
+  const loginForm = document.getElementById('loginForm');
+  const loginError = document.getElementById('loginError');
+  let refreshTimer = null;
+
+  function getToken() {
+    return localStorage.getItem(TOKEN_KEY);
+  }
+
+  function setToken(token) {
+    if (token) localStorage.setItem(TOKEN_KEY, token);
+    else localStorage.removeItem(TOKEN_KEY);
+  }
+
+  function authFetch(url, options) {
+    const token = getToken();
+    const headers = Object.assign({}, (options && options.headers) || {}, token ? { Authorization: 'Bearer ' + token } : {});
+    return fetch(url, Object.assign({}, options, { headers }));
+  }
+
+  function showLogin(message) {
+    loginOverlay.classList.remove('hidden');
+    loginError.textContent = message || '';
+    if (refreshTimer) {
+      clearInterval(refreshTimer);
+      refreshTimer = null;
+    }
+  }
+
+  function hideLogin() {
+    loginOverlay.classList.add('hidden');
+  }
+
+  loginForm.addEventListener('submit', async function (e) {
+    e.preventDefault();
+    loginError.textContent = '';
+    const username = document.getElementById('loginUsername').value;
+    const password = document.getElementById('loginPassword').value;
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: username, password: password }),
+      });
+      const body = await res.json();
+      if (!res.ok) {
+        loginError.textContent = body.error || 'Login failed';
+        return;
+      }
+      setToken(body.token);
+      hideLogin();
+      startPolling();
+    } catch (err) {
+      loginError.textContent = "Can't reach GridSync-OS";
+    }
+  });
+
+  document.getElementById('logoutBtn').addEventListener('click', async function () {
+    try {
+      await authFetch('/api/auth/logout', { method: 'POST' });
+    } catch {
+      // best-effort -- clear the local token regardless
+    }
+    setToken(null);
+    showLogin();
+  });
 
   function modeClass(mode) {
     if (mode === 'NORMAL') return 'normal';
@@ -311,10 +476,16 @@
   async function refresh() {
     try {
       const [snapshotRes, devicesRes, historyRes] = await Promise.all([
-        fetch('/api/snapshot'),
-        fetch('/api/devices'),
-        fetch('/api/commands/history?limit=25'),
+        authFetch('/api/snapshot'),
+        authFetch('/api/devices'),
+        authFetch('/api/commands/history?limit=25'),
       ]);
+
+      if (snapshotRes.status === 401 || devicesRes.status === 401 || historyRes.status === 401) {
+        setToken(null);
+        showLogin('Session expired — please sign in again.');
+        return;
+      }
       if (!snapshotRes.ok || !devicesRes.ok || !historyRes.ok) throw new Error('non-OK response');
 
       const snapshot = await snapshotRes.json();
@@ -335,8 +506,34 @@
     }
   }
 
-  refresh();
-  setInterval(refresh, REFRESH_MS);
+  function startPolling() {
+    refresh();
+    if (refreshTimer) clearInterval(refreshTimer);
+    refreshTimer = setInterval(refresh, REFRESH_MS);
+  }
+
+  async function init() {
+    if (!getToken()) {
+      showLogin();
+      return;
+    }
+    try {
+      const res = await authFetch('/api/auth/me');
+      if (!res.ok) {
+        setToken(null);
+        showLogin();
+        return;
+      }
+      const me = await res.json();
+      document.getElementById('whoami').innerHTML = escapeHtml(me.username) + ' <b>(' + escapeHtml(me.role) + ')</b>';
+      hideLogin();
+      startPolling();
+    } catch {
+      showLogin("Can't reach GridSync-OS");
+    }
+  }
+
+  init();
 })();
 </script>
 </body>

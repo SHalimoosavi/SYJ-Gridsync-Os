@@ -53,6 +53,21 @@ module.exports = {
     maxWalLinesBeforeCompaction: num('GS_WAL_MAX_LINES', 5000),
   },
 
+  // -- Authentication & RBAC --
+  auth: {
+    // If unset, a random secret is generated per-process at startup (logs a
+    // warning) -- sessions won't survive a restart. Set this for anything
+    // beyond local/dev use.
+    jwtSecret: process.env.GS_JWT_SECRET || null,
+    jwtExpiresInSeconds: num('GS_JWT_EXPIRES_IN', 3600), // login sessions, default 1 hour
+    // If the user store is empty at startup and both of these are set, an
+    // initial admin account is created automatically. Otherwise use
+    // scripts/create-user.js, or the legacy GS_API_TOKEN (see api.token)
+    // which is always treated as ADMIN-equivalent regardless of user accounts.
+    bootstrapAdminUsername: process.env.GS_BOOTSTRAP_ADMIN_USERNAME || null,
+    bootstrapAdminPassword: process.env.GS_BOOTSTRAP_ADMIN_PASSWORD || null,
+  },
+
   // -- REST API + monitoring dashboard --
   api: {
     enabled: process.env.GS_API_ENABLED !== 'false', // default on; set to 'false' to disable entirely

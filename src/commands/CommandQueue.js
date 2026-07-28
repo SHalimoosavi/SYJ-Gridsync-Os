@@ -80,6 +80,7 @@ class CommandQueue extends EventEmitter {
       deviceId: command.deviceId,
       value: command.value,
       reason: command.reason || null,
+      issuedBy: command.issuedBy || 'SYSTEM', // e.g. a username, or 'SYSTEM' for auto-generated FSM effects
       status: 'PENDING',
       attempts: 0,
       createdAt: Date.now(),
