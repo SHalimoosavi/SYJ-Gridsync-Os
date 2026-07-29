@@ -3,7 +3,7 @@
 const { clamp, assertPlainObject } = require('../utils/validation');
 const { ConstraintViolationError } = require('../utils/errors');
 
-const COMMAND_TYPES = ['CURTAIL', 'DISCHARGE', 'CHARGE', 'STANDBY'];
+const COMMAND_TYPES = ['CURTAIL', 'DISCHARGE', 'CHARGE', 'STANDBY', 'RESET'];
 
 class ConstraintValidator {
   constructor(gridConstraints) {
@@ -96,6 +96,14 @@ class ConstraintValidator {
         break;
       }
       case 'STANDBY': {
+        shaped.value = 0;
+        break;
+      }
+      case 'RESET': {
+        // Always allowed regardless of telemetry state -- an operator must
+        // be able to attempt a reset even on a device currently in ALERT.
+        // Side effect (acknowledging active alarms) is handled by the
+        // orchestrator, not here -- this validator only shapes the command.
         shaped.value = 0;
         break;
       }

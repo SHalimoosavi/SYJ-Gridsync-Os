@@ -62,6 +62,25 @@ class StorageAdapter {
     throw new Error('StorageAdapter.queryCommandHistory() not implemented');
   }
 
+  /**
+   * Appends one immutable event to the alarm WAL. `record` must include at
+   * minimum: {alarmId, event, status, deviceId, type, ts}.
+   */
+  // eslint-disable-next-line class-methods-use-this, no-unused-vars
+  async appendAlarmEvent(_record) {
+    throw new Error('StorageAdapter.appendAlarmEvent() not implemented');
+  }
+
+  /**
+   * Returns the most recent alarm records (one per alarmId, latest known
+   * state), newest first, capped at `limit`.
+   * @returns {Promise<object[]>}
+   */
+  // eslint-disable-next-line class-methods-use-this, no-unused-vars
+  async queryAlarmHistory(_limit) {
+    throw new Error('StorageAdapter.queryAlarmHistory() not implemented');
+  }
+
   // eslint-disable-next-line class-methods-use-this
   async close() {
     throw new Error('StorageAdapter.close() not implemented');

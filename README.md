@@ -11,12 +11,14 @@
 <br/>
 
 ![Node.js](https://img.shields.io/badge/Node.js-%E2%89%A518-green?logo=node.js&logoColor=white)
+![Version](https://img.shields.io/badge/Version-v0.4.0-blueviolet)
 ![License](https://img.shields.io/badge/License-Proprietary-blue)
-![Tests](https://img.shields.io/badge/Self--Tests-62%20Passing-success?logo=checkmarx&logoColor=white)
+![Tests](https://img.shields.io/badge/Self--Tests-79%20Passing-success?logo=checkmarx&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Termux%20%7C%20Linux%20%7C%20Windows-orange)
 ![MQTT](https://img.shields.io/badge/MQTT-Supported-660066?logo=mqtt&logoColor=white)
 ![API](https://img.shields.io/badge/REST%20API-Dashboard%20%2B%20Endpoints-informational)
 ![Auth](https://img.shields.io/badge/Auth-JWT%20%2B%20RBAC-critical)
+![Alarms](https://img.shields.io/badge/Alarm%20Engine-6%20Types-yellow)
 ![Industrial](https://img.shields.io/badge/Industrial-IIoT-red)
 ![Dependencies](https://img.shields.io/badge/Native%20Deps-Zero-blueviolet)
 
@@ -36,6 +38,7 @@
 - [Command Lifecycle & Crash Recovery](#command-lifecycle--crash-recovery)
 - [REST API & Monitoring Dashboard](#rest-api--monitoring-dashboard)
 - [Authentication & RBAC](#authentication--rbac)
+- [Operations Console (v0.4.0)](#operations-console-v040)
 - [Project Structure](#project-structure)
 - [Getting Started (Termux)](#getting-started-termux)
 - [Initializing Your Own Git Repository](#initializing-your-own-git-repository)
@@ -203,8 +206,11 @@ Open that URL in a browser for a live view of device fleet status (voltage/frequ
 | GET | `/api/devices/:deviceId` | VIEWER | Detail for one device (404 if never seen) |
 | GET | `/api/devices/:deviceId/telemetry?limit=N` | VIEWER | Recent telemetry history, newest first (default 50, max 500) |
 | GET | `/api/commands/pending` | VIEWER | Currently live (non-terminal) commands |
-| GET | `/api/commands/history?limit=N` | VIEWER | Recent command history, including who issued each one (default 50, max 500) |
-| POST | `/api/commands` | OPERATOR | Issue a manual command: `{"type","deviceId","value","reason"}` |
+| GET | `/api/commands/history?limit=N&deviceId=X&status=Y` | VIEWER | Recent command history, including who issued each one (default 50, max 500) |
+| POST | `/api/commands` | OPERATOR | Issue a manual command: `{"type","deviceId","value","reason"}` (types: `CURTAIL`,`DISCHARGE`,`CHARGE`,`STANDBY`,`RESET`) |
+| GET | `/api/alarms/active` | VIEWER | Currently active (unresolved) alarms fleet-wide |
+| GET | `/api/alarms/history?limit=N&deviceId=X&status=Y` | VIEWER | Recent alarm history (triggered/cleared/acknowledged) |
+| POST | `/api/alarms/:alarmId/acknowledge` | OPERATOR | Acknowledge one active alarm |
 | GET | `/api/auth/users` | ADMIN | List accounts (sanitized -- no password hashes) |
 | POST | `/api/auth/users` | ADMIN | Create an account: `{"username","password","role"}` |
 | POST | `/api/auth/users/:userId/disable` | ADMIN | Disable an account |
@@ -275,7 +281,62 @@ Both are JWTs signed with the same secret, but serve different purposes:
 
 `GS_JWT_SECRET` should be set explicitly for anything beyond local/dev use -- if unset, a random secret is generated per process start, which means **every restart invalidates all existing sessions and tokens.**
 
+---
 
+## Operations Console (v0.4.0)
+
+Four capabilities operators actually use day-to-day, all built on the authentication foundation: **Command Center**, **Alarm Engine**, **Command History filtering**, and **Live Telemetry Charts**.
+
+### Command Center
+
+The dashboard's "Live Telemetry & Device Control" section lets an OPERATOR or ADMIN select a device and issue a command (`CURTAIL`, `DISCHARGE`, `CHARGE`, `STANDBY`, `RESET`) directly -- with a confirmation dialog before anything is sent, and the same durability/constraint/circuit-breaker guarantees as auto-generated commands (see [Command Lifecycle & Crash Recovery](#command-lifecycle--crash-recovery)). VIEWER accounts see a read-only notice instead of the form -- the UI hides it, and the API independently enforces it (`403` on `POST /api/commands` below OPERATOR), so hiding the button is a UX nicety, not the actual security boundary.
+
+`RESET` is new in v0.4.0: it's a real command sent to the device (adapters `ack` it like any other), *and* it acknowledges every currently-active alarm for that device. It does not force-clear alarms whose underlying condition hasn't actually resolved -- see the lifecycle below.
+
+### Alarm Engine
+
+Six alarm types, evaluated independently from the state machine's control-loop decisions (same `gridConstraints` thresholds, but the state machine decides *actions*, the alarm engine decides *notifications* -- deliberately separate concerns):
+
+| Type | Severity | Trigger |
+|---|---|---|
+| `OVER_VOLTAGE` | CRITICAL | voltage exceeds `gridConstraints.voltage.max` |
+| `UNDER_VOLTAGE` | CRITICAL | voltage below `gridConstraints.voltage.min` |
+| `HIGH_FREQUENCY` | WARNING | frequency exceeds `gridConstraints.frequency.max` |
+| `LOW_SOC` | WARNING | state of charge below `gridConstraints.soc.min` |
+| `COMM_TIMEOUT` | WARNING | no telemetry for `GS_COMM_TIMEOUT_MS` (default 7.5s) -- an early, softer signal |
+| `DEVICE_OFFLINE` | CRITICAL | no telemetry for `GS_STALE_MS` (same threshold the circuit breaker uses) -- the device is now untrusted for commands too |
+
+Every trigger/clear/acknowledge event is persisted to a durable WAL (mirroring the command queue's proven pattern), so alarm history survives a restart.
+
+```mermaid
+stateDiagram-v2
+    [*] --> ACTIVE: threshold crossed
+    ACTIVE --> CLEARED: telemetry back in range
+    CLEARED --> ACTIVE: threshold crossed again
+    CLEARED --> [*]
+
+    note right of ACTIVE
+        Acknowledged is a separate flag, set via
+        the RESET command or the acknowledge
+        endpoint. It does not change status --
+        an acknowledged alarm can still be ACTIVE
+        if the underlying condition persists.
+    end note
+```
+
+Endpoints: `GET /api/alarms/active`, `GET /api/alarms/history?limit=N&deviceId=X&status=Y`, `POST /api/alarms/:alarmId/acknowledge` (OPERATOR+). The dashboard's "Active Alarms" panel polls the first and lets OPERATOR+ users acknowledge directly.
+
+### Command History filtering
+
+`GET /api/commands/history` (and the equivalent `/api/alarms/history`) now accept `?deviceId=X` and `?status=Y` query filters, so "show me everything that happened to inverter-01" or "show me every FAILED command fleet-wide" is a single request rather than client-side filtering of the full history.
+
+### Live Telemetry Charts
+
+Voltage, Frequency, Power, and State-of-Charge, rendered as small SVG line charts for whichever device is selected in the shared device dropdown (the same selector that targets the Command Center). **Hand-rolled, not a charting library** -- consistent with the rest of the dashboard's zero-external-dependency approach; there's no Chart.js/D3 script tag to fail loading on a flaky connection. A device that doesn't report a given metric (e.g. a `METER` with no `soc`) shows "No data" for that chart rather than a broken/empty plot.
+
+---
+
+## Project Structure
 
 <details>
 <summary><b>Click to expand full file tree</b></summary>
@@ -305,7 +366,8 @@ gridsync-os/
 │   ├── engine/
 │   │   ├── StateMachine.js            # pure (state, telemetry) -> (newState, commands) FSM
 │   │   ├── ConstraintValidator.js     # grid-limit checks + command clamping/authorization
-│   │   └── CircuitBreaker.js          # blocks commands on stale telemetry / error storms
+│   │   ├── CircuitBreaker.js          # blocks commands on stale telemetry / error storms
+│   │   └── AlarmEngine.js             # 6 alarm types, trigger/clear/acknowledge lifecycle
 │   ├── commands/
 │   │   ├── CommandQueue.js            # durable WAL-backed command queue
 │   │   └── CommandDispatcher.js       # retry logic, breaker/constraint re-checks per attempt
@@ -327,7 +389,7 @@ gridsync-os/
 │   ├── setup-termux.sh                # one-shot Termux environment bootstrap
 │   └── create-user.js                 # CLI account bootstrap/recovery (bypasses the API)
 └── test/
-    └── selftest.js             # 62 tests: unit + simulated end-to-end scenarios
+    └── selftest.js             # 79 tests: unit + simulated end-to-end scenarios
 ```
 
 </details>
@@ -341,7 +403,7 @@ pkg update && pkg install nodejs git -y
 git clone <your-repo-url> gridsync-os   # or unzip the delivered archive
 cd gridsync-os
 npm install          # pure-JS deps only, no compilation step
-npm test             # run the full self-test suite (62 tests)
+npm test             # run the full self-test suite (79 tests)
 npm start             # boot the orchestrator (MQTT + simulated Modbus/DNP3)
 ```
 
@@ -391,6 +453,8 @@ Everything tunable lives in `src/config.js` and is overridable via environment v
 | `GS_JWT_SECRET` | random per-process | HS256 signing secret -- set explicitly so sessions survive restarts |
 | `GS_JWT_EXPIRES_IN` | 3600 | Login session lifetime, seconds |
 | `GS_BOOTSTRAP_ADMIN_USERNAME` / `GS_BOOTSTRAP_ADMIN_PASSWORD` | unset | If both set and the user store is empty, creates this ADMIN account on startup |
+| `GS_COMM_TIMEOUT_MS` | 7500 | Softer/earlier `COMM_TIMEOUT` alarm threshold (fires before `DEVICE_OFFLINE`) |
+| `GS_ALARM_CHECK_INTERVAL_MS` | 5000 | How often all known devices are swept for staleness (`COMM_TIMEOUT`/`DEVICE_OFFLINE` can only be detected by absence of telemetry, not a triggering event) |
 
 Grid safety limits (voltage/frequency/SoC bounds, max curtail/charge/discharge kW) are in `src/config.js` under `gridConstraints` — these are illustrative LV-distribution defaults (230V ±10%, 50Hz ±0.5) and **must be reviewed against your actual grid code and asset ratings before any real deployment.**
 
@@ -414,7 +478,7 @@ Grid safety limits (voltage/frequency/SoC bounds, max curtail/charge/discharge k
 npm test
 ```
 
-62 tests covering:
+79 tests covering:
 
 - ✅ Pure-function correctness of the state machine (deterministic transitions, auto-curtailment on overvoltage, release on recovery)
 - ✅ Constraint validation (clamping over-limit commands, rejecting unsafe discharge/charge based on SoC, fail-closed on unknown state)
@@ -428,20 +492,22 @@ npm test
 - ✅ REST API routing (`Router` param extraction/matching) and full end-to-end HTTP tests against a real server on an OS-assigned port: every `/api/*` endpoint requires authentication (401 unauthenticated), malformed-JSON (400) and oversized-body (413) handling
 - ✅ Password hashing and JWT sign/verify correctness (roundtrip, tampered signature/payload rejected, expired token rejected, malformed token rejected) and the user store (duplicate usernames rejected, disabled accounts blocked, password hashes never exposed via the API)
 - ✅ Full RBAC enforcement end-to-end: VIEWER blocked (403) from issuing commands, OPERATOR allowed (202) with the audit trail correctly recording who issued it, only ADMIN can create accounts, logout immediately revokes a token, the legacy `GS_API_TOKEN` still works as ADMIN-equivalent, and bootstrap-admin auto-creation on first startup
+- ✅ Alarm engine: all 6 alarm types trigger/clear correctly, no duplicate alarms while a condition persists, `COMM_TIMEOUT` fires before `DEVICE_OFFLINE` (softer threshold first), acknowledge/acknowledgeAllForDevice scoping, and full persistence (`SqliteStorage`'s alarm + filtered-query support -- previously entirely untested -- now has dedicated coverage alongside `FileWalStorage`)
+- ✅ `RESET` command end-to-end: dispatches to the adapter *and* acknowledges (not force-clears) active alarms for that device; command/alarm history `deviceId`/`status` query filters
 - ✅ Full end-to-end: simulated overvoltage telemetry through the whole stack, confirming the resulting command stays within configured safe bounds
 
 ## Roadmap
 
-**Built:** Authentication & RBAC (JWT sessions, scrypt-hashed accounts, 3 roles, audit trail on commands via `issuedBy`, legacy-token backward compatibility).
+**Built:**
+- **Authentication & RBAC**: JWT sessions, scrypt-hashed accounts, 3 roles, audit trail on commands via `issuedBy`, legacy-token backward compatibility.
+- **v0.4.0 Operations Console**: Command Center (dashboard form + confirmation dialog + RBAC-aware visibility, `RESET` command type), Alarm Engine (6 types, persisted trigger/clear/acknowledge lifecycle), Command/Alarm History filtering (`deviceId`/`status` query params), Live Telemetry Charts (hand-rolled SVG, no charting library).
 
 **Not yet built** (tracked, not silently dropped):
-- Command Center UI (confirmation dialogs, live status Pending→Sent→ACK→Failed in the dashboard itself -- the API already supports this via `/api/commands`, the dashboard doesn't have the issue-a-command form yet)
-- Historical database with time-range queries (last hour/day/week/month) -- current storage supports "most recent N," not date-range queries
-- Live charts (voltage/frequency/power/SoC over time)
-- Alarm system (over/under-voltage, high frequency, low SoC, device offline, comms timeout) as a distinct concept from the state machine's `ALERT` mode
-- Structured event log (logins, commands, warnings, alarms, recoveries) as a unified queryable audit surface -- individual pieces exist (command history has `issuedBy`; auth failures are logged) but there's no single log endpoint yet
+- Live command status transitions *inside the dashboard UI* (Pending→Dispatching→ACK/Failed) -- the API and data already support this (`/api/commands/pending`, `/api/commands/history`), the dashboard shows the current state on each poll but doesn't animate the transition in place
+- Historical database with true time-range queries (last hour/day/week/month) -- current storage supports "most recent N," not date-range queries; this is what a `TimescaleStorage.js` backend (see [Going to Production](#going-to-production)) would properly solve
+- Structured event log (logins, commands, warnings, alarms, recoveries) as a *unified* queryable audit surface -- the individual pieces exist (command history has `issuedBy`; alarm history exists; auth failures are logged) but there's no single combined log endpoint yet
 - Device management (add/remove/enable/disable/metadata/firmware tracking) -- devices are currently discovered implicitly via telemetry, not explicitly managed
-- Dashboard summary cards (total generation/load, fleet health, active alarms)
+- Full dashboard summary cards (Total Generation, Total Load, Fleet Health, Average Voltage) -- active-alarm and pending-command counts already appear in the status strip, but not as the complete 6-card set originally scoped
 - WebSocket/SSE streaming to replace dashboard polling
 - Docker, CI/CD pipeline, `/metrics` endpoint
 

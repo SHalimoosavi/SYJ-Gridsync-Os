@@ -88,6 +88,11 @@ class CircuitBreaker {
       recentErrorCount: this._errorTimestamps.length,
     };
   }
+
+  /** @returns {{deviceId: string, lastSeen: number}[]} every device with at least one recorded telemetry point. */
+  listTrackedDevices() {
+    return [...this._lastSeen.entries()].map(([deviceId, lastSeen]) => ({ deviceId, lastSeen }));
+  }
 }
 
 module.exports = { CircuitBreaker };

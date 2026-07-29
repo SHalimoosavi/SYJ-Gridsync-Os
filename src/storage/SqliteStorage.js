@@ -73,6 +73,17 @@ class SqliteStorage extends StorageAdapter {
         ts INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_cmd_events_command_id ON command_events(command_id);
+
+      CREATE TABLE IF NOT EXISTS alarm_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        alarm_id TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        event TEXT NOT NULL,
+        status TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        ts INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_alarm_events_alarm_id ON alarm_events(alarm_id);
     `);
 
     this._insertTelemetryStmt = this.db.prepare(
@@ -80,6 +91,9 @@ class SqliteStorage extends StorageAdapter {
     );
     this._insertCommandEventStmt = this.db.prepare(
       'INSERT INTO command_events (command_id, event, status, attempts, payload_json, ts) VALUES (?, ?, ?, ?, ?, ?)',
+    );
+    this._insertAlarmEventStmt = this.db.prepare(
+      'INSERT INTO alarm_events (alarm_id, device_id, event, status, payload_json, ts) VALUES (?, ?, ?, ?, ?, ?)',
     );
   }
 
@@ -112,6 +126,23 @@ class SqliteStorage extends StorageAdapter {
       );
     } catch (err) {
       throw new StorageError('SQLite command event insert failed', { cause: err.message });
+    }
+  }
+
+  async appendAlarmEvent(record) {
+    assertPlainObject(record, 'record');
+    if (!record.alarmId) throw new StorageError('appendAlarmEvent requires record.alarmId', { record });
+    try {
+      this._insertAlarmEventStmt.run(
+        record.alarmId,
+        record.deviceId,
+        record.event,
+        record.status,
+        JSON.stringify(record),
+        record.ts || Date.now(),
+      );
+    } catch (err) {
+      throw new StorageError('SQLite alarm event insert failed', { cause: err.message });
     }
   }
 
@@ -150,19 +181,53 @@ class SqliteStorage extends StorageAdapter {
     }
   }
 
-  async queryCommandHistory(limit) {
+  async queryCommandHistory(limit, filters = {}) {
     try {
-      const rows = this.db
-        .prepare(
-          `SELECT ce.* FROM command_events ce
+      let sql = `SELECT ce.* FROM command_events ce
            INNER JOIN (SELECT command_id, MAX(id) AS max_id FROM command_events GROUP BY command_id) latest
-           ON ce.command_id = latest.command_id AND ce.id = latest.max_id
-           ORDER BY ce.ts DESC LIMIT ?`,
-        )
-        .all(limit);
+           ON ce.command_id = latest.command_id AND ce.id = latest.max_id`;
+      const params = [];
+      const where = [];
+      if (filters.deviceId) {
+        where.push(`json_extract(ce.payload_json, '$.deviceId') = ?`);
+        params.push(filters.deviceId);
+      }
+      if (filters.status) {
+        where.push('ce.status = ?');
+        params.push(filters.status);
+      }
+      if (where.length) sql += ` WHERE ${where.join(' AND ')}`;
+      sql += ' ORDER BY ce.ts DESC LIMIT ?';
+      params.push(limit);
+      const rows = this.db.prepare(sql).all(...params);
       return rows.map((r) => JSON.parse(r.payload_json));
     } catch (err) {
       throw new StorageError('SQLite command history query failed', { cause: err.message });
+    }
+  }
+
+  async queryAlarmHistory(limit, filters = {}) {
+    try {
+      let sql = `SELECT ae.* FROM alarm_events ae
+           INNER JOIN (SELECT alarm_id, MAX(id) AS max_id FROM alarm_events GROUP BY alarm_id) latest
+           ON ae.alarm_id = latest.alarm_id AND ae.id = latest.max_id`;
+      const params = [];
+      const where = [];
+      if (filters.deviceId) {
+        where.push('ae.device_id = ?');
+        params.push(filters.deviceId);
+      }
+      if (filters.status) {
+        where.push('ae.status = ?');
+        params.push(filters.status);
+      }
+      if (where.length) sql += ` WHERE ${where.join(' AND ')}`;
+      sql += ' ORDER BY ae.ts DESC LIMIT ?';
+      params.push(limit);
+      const rows = this.db.prepare(sql).all(...params);
+      return rows.map((r) => JSON.parse(r.payload_json));
+    } catch (err) {
+      throw new StorageError('SQLite alarm history query failed', { cause: err.message });
     }
   }
 

@@ -15,9 +15,11 @@ const { IngestionManager } = require('../src/ingestion/IngestionManager');
 const { ConstraintValidator } = require('../src/engine/ConstraintValidator');
 const { CircuitBreaker } = require('../src/engine/CircuitBreaker');
 const { StateMachine, MODES } = require('../src/engine/StateMachine');
+const { AlarmEngine } = require('../src/engine/AlarmEngine');
 const { CommandQueue } = require('../src/commands/CommandQueue');
 const { CommandDispatcher } = require('../src/commands/CommandDispatcher');
 const { FileWalStorage } = require('../src/storage/FileWalStorage');
+const { SqliteStorage } = require('../src/storage/SqliteStorage');
 const { AdapterBase } = require('../src/adapters/AdapterBase');
 const { MqttAdapter } = require('../src/adapters/MqttAdapter');
 const { GridSyncOrchestrator } = require('../src/orchestrator/GridSyncOrchestrator');
@@ -340,8 +342,100 @@ test('StateMachine: transition is deterministic (same inputs -> same outputs)', 
 });
 
 // ---------------------------------------------------------------------------
-// CommandQueue durability + crash recovery (THE data-integrity requirement)
+// ConstraintValidator: RESET command
 // ---------------------------------------------------------------------------
+
+test('ConstraintValidator: RESET is always allowed, even with unknown device state', () => {
+  const cv = new ConstraintValidator(baseConfig.gridConstraints);
+  const shaped = cv.validateCommand({ type: 'RESET', deviceId: 'inv-01', value: 999 }, null);
+  assert.equal(shaped.value, 0);
+});
+
+// ---------------------------------------------------------------------------
+// AlarmEngine: pure trigger/clear decision logic
+// ---------------------------------------------------------------------------
+
+function makeAlarmEngine(overrides = {}) {
+  return new AlarmEngine({
+    gridConstraints: baseConfig.gridConstraints,
+    commTimeoutMs: overrides.commTimeoutMs ?? 5000,
+    staleTelemetryMs: overrides.staleTelemetryMs ?? 10000,
+    logger: quietLogger,
+  });
+}
+
+test('AlarmEngine: triggers OVER_VOLTAGE and clears it when telemetry returns to range', () => {
+  const engine = makeAlarmEngine();
+  const over = engine.evaluateTelemetry({ deviceId: 'inv-01', metrics: { voltage: 300 } });
+  assert.equal(over.length, 1);
+  assert.equal(over[0].type, 'OVER_VOLTAGE');
+  assert.equal(over[0].event, 'TRIGGERED');
+  assert.equal(over[0].severity, 'CRITICAL');
+  assert.equal(engine.listActive().length, 1);
+
+  const normal = engine.evaluateTelemetry({ deviceId: 'inv-01', metrics: { voltage: 230 } });
+  assert.equal(normal.length, 1);
+  assert.equal(normal[0].event, 'CLEARED');
+  assert.equal(engine.listActive().length, 0);
+});
+
+test('AlarmEngine: triggers UNDER_VOLTAGE, HIGH_FREQUENCY, and LOW_SOC independently', () => {
+  const engine = makeAlarmEngine();
+  const events = engine.evaluateTelemetry({ deviceId: 'inv-01', metrics: { voltage: 100, frequency: 52, soc: 0.01 } });
+  const types = events.filter((e) => e.event === 'TRIGGERED').map((e) => e.type);
+  assert.ok(types.includes('UNDER_VOLTAGE'));
+  assert.ok(types.includes('HIGH_FREQUENCY'));
+  assert.ok(types.includes('LOW_SOC'));
+});
+
+test('AlarmEngine: does not trigger a duplicate alarm while a condition persists', () => {
+  const engine = makeAlarmEngine();
+  const first = engine.evaluateTelemetry({ deviceId: 'inv-01', metrics: { voltage: 300 } });
+  const second = engine.evaluateTelemetry({ deviceId: 'inv-01', metrics: { voltage: 305 } });
+  assert.equal(first.filter((e) => e.type === 'OVER_VOLTAGE').length, 1);
+  assert.equal(second.filter((e) => e.type === 'OVER_VOLTAGE').length, 0, 'no duplicate TRIGGERED event while still active');
+  assert.equal(engine.listActive().length, 1);
+});
+
+test('AlarmEngine: staleness sweep triggers COMM_TIMEOUT before DEVICE_OFFLINE (softer threshold first)', () => {
+  const engine = makeAlarmEngine({ commTimeoutMs: 5000, staleTelemetryMs: 10000 });
+  const now = 1_000_000;
+  const lastSeen = now - 7000; // past commTimeoutMs, not yet past staleTelemetryMs
+
+  const events = engine.evaluateStaleness('inv-01', lastSeen, now);
+  const types = events.filter((e) => e.event === 'TRIGGERED').map((e) => e.type);
+  assert.ok(types.includes('COMM_TIMEOUT'));
+  assert.ok(!types.includes('DEVICE_OFFLINE'));
+
+  const laterEvents = engine.evaluateStaleness('inv-01', lastSeen, now + 5000); // now past both thresholds
+  const laterTypes = laterEvents.filter((e) => e.event === 'TRIGGERED').map((e) => e.type);
+  assert.ok(laterTypes.includes('DEVICE_OFFLINE'));
+});
+
+test('AlarmEngine: acknowledge() marks an active alarm acknowledged; returns null for a non-active id', () => {
+  const engine = makeAlarmEngine();
+  const [triggered] = engine.evaluateTelemetry({ deviceId: 'inv-01', metrics: { voltage: 300 } });
+  const ack = engine.acknowledge(triggered.alarmId, 'operator1');
+  assert.equal(ack.acknowledged, true);
+  assert.equal(ack.acknowledgedBy, 'operator1');
+  assert.equal(ack.event, 'ACKNOWLEDGED');
+
+  assert.equal(engine.acknowledge('nonexistent-id', 'operator1'), null);
+});
+
+test('AlarmEngine: acknowledgeAllForDevice() only affects that device\'s alarms', () => {
+  const engine = makeAlarmEngine();
+  engine.evaluateTelemetry({ deviceId: 'inv-01', metrics: { voltage: 300 } });
+  engine.evaluateTelemetry({ deviceId: 'inv-02', metrics: { voltage: 300 } });
+
+  const acked = engine.acknowledgeAllForDevice('inv-01', 'operator1');
+  assert.equal(acked.length, 1);
+  assert.equal(acked[0].deviceId, 'inv-01');
+
+  const active = engine.listActive();
+  const inv02Alarm = active.find((a) => a.deviceId === 'inv-02');
+  assert.equal(inv02Alarm.acknowledged, false, 'acknowledging one device must not affect another');
+});
 
 test('CommandQueue: a command that was mid-dispatch when the process "crashed" is recovered on restart', async () => {
   const dataDir = await mkTempDir();
@@ -411,6 +505,99 @@ test('CommandQueue: ACKED commands are NOT recovered after restart (already deli
     const recoveredCount = await queue2.recover();
     assert.equal(recoveredCount, 0);
     await storage2.close();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('FileWalStorage: alarm events persist and queryAlarmHistory returns latest state per alarm, newest first', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const storage = new FileWalStorage({
+      dataDir,
+      compactionIntervalMs: 999999999,
+      maxWalLinesBeforeCompaction: 999999999,
+      logger: quietLogger,
+    });
+    await storage.init();
+
+    await storage.appendAlarmEvent({ alarmId: 'a1', deviceId: 'inv-01', event: 'TRIGGERED', status: 'ACTIVE', type: 'OVER_VOLTAGE', ts: 1000 });
+    await storage.appendAlarmEvent({ alarmId: 'a2', deviceId: 'inv-02', event: 'TRIGGERED', status: 'ACTIVE', type: 'LOW_SOC', ts: 2000 });
+    await storage.appendAlarmEvent({ alarmId: 'a1', deviceId: 'inv-01', event: 'CLEARED', status: 'CLEARED', type: 'OVER_VOLTAGE', ts: 3000 });
+
+    const history = await storage.queryAlarmHistory(50);
+    assert.equal(history.length, 2, 'one record per alarmId, latest state wins');
+    assert.equal(history[0].alarmId, 'a1', 'newest-first ordering (a1 was updated last, at ts 3000)');
+    assert.equal(history[0].status, 'CLEARED');
+    assert.equal(history[1].status, 'ACTIVE');
+
+    const filtered = await storage.queryAlarmHistory(50, { deviceId: 'inv-02' });
+    assert.equal(filtered.length, 1);
+    assert.equal(filtered[0].alarmId, 'a2');
+
+    await storage.close();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('FileWalStorage: queryCommandHistory respects deviceId and status filters', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const storage = new FileWalStorage({
+      dataDir,
+      compactionIntervalMs: 999999999,
+      maxWalLinesBeforeCompaction: 999999999,
+      logger: quietLogger,
+    });
+    await storage.init();
+
+    await storage.appendCommandEvent({ commandId: 'c1', deviceId: 'inv-01', event: 'CREATED', status: 'ACKED', ts: 1000 });
+    await storage.appendCommandEvent({ commandId: 'c2', deviceId: 'inv-02', event: 'CREATED', status: 'FAILED', ts: 2000 });
+
+    const byDevice = await storage.queryCommandHistory(50, { deviceId: 'inv-01' });
+    assert.equal(byDevice.length, 1);
+    assert.equal(byDevice[0].commandId, 'c1');
+
+    const byStatus = await storage.queryCommandHistory(50, { status: 'FAILED' });
+    assert.equal(byStatus.length, 1);
+    assert.equal(byStatus[0].commandId, 'c2');
+
+    await storage.close();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('SqliteStorage: full interface (telemetry, commands, alarms, filters) -- previously had zero coverage', { skip: !SqliteStorage.isSupported() }, async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const storage = new SqliteStorage({ dataDir, logger: quietLogger });
+    await storage.init();
+
+    await storage.appendTelemetry({ deviceId: 'inv-01', protocol: 'MQTT', deviceType: 'INVERTER', timestamp: 1000, metrics: { voltage: 230 } });
+    await storage.appendTelemetry({ deviceId: 'inv-01', protocol: 'MQTT', deviceType: 'INVERTER', timestamp: 2000, metrics: { voltage: 231 } });
+    const telemetry = await storage.queryTelemetry('inv-01', 10);
+    assert.equal(telemetry.length, 2);
+    assert.equal(telemetry[0].timestamp, 2000, 'newest first');
+
+    await storage.appendCommandEvent({ commandId: 'c1', deviceId: 'inv-01', event: 'CREATED', status: 'ACKED', attempts: 0, ts: 1000 });
+    await storage.appendCommandEvent({ commandId: 'c2', deviceId: 'inv-02', event: 'CREATED', status: 'FAILED', attempts: 1, ts: 2000 });
+    assert.equal((await storage.queryCommandHistory(10)).length, 2);
+    assert.equal((await storage.queryCommandHistory(10, { deviceId: 'inv-01' })).length, 1);
+    assert.equal((await storage.queryCommandHistory(10, { status: 'FAILED' })).length, 1);
+    assert.equal((await storage.loadPendingCommands()).length, 0, 'both commands are terminal (ACKED/FAILED)');
+
+    await storage.appendAlarmEvent({ alarmId: 'a1', deviceId: 'inv-01', event: 'TRIGGERED', status: 'ACTIVE', type: 'OVER_VOLTAGE', ts: 1000 });
+    await storage.appendAlarmEvent({ alarmId: 'a2', deviceId: 'inv-02', event: 'TRIGGERED', status: 'ACTIVE', type: 'LOW_SOC', ts: 2000 });
+    await storage.appendAlarmEvent({ alarmId: 'a1', deviceId: 'inv-01', event: 'CLEARED', status: 'CLEARED', type: 'OVER_VOLTAGE', ts: 3000 });
+    const alarmHistory = await storage.queryAlarmHistory(10);
+    assert.equal(alarmHistory.length, 2, 'latest state per alarmId');
+    assert.equal(alarmHistory.find((a) => a.alarmId === 'a1').status, 'CLEARED');
+    assert.equal((await storage.queryAlarmHistory(10, { deviceId: 'inv-02' })).length, 1);
+    assert.equal((await storage.queryAlarmHistory(10, { status: 'CLEARED' })).length, 1);
+
+    await storage.close();
   } finally {
     await rmTempDir(dataDir);
   }
@@ -1246,6 +1433,180 @@ test('ApiServer: unknown route returns 404 regardless of auth', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// v0.4.0: Alarm Engine integration (orchestrator + API), RESET command,
+// staleness sweep, and command/alarm history filtering
+// ---------------------------------------------------------------------------
+
+test('Orchestrator: overvoltage telemetry produces an active alarm; recovery clears it', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const cfg = makeTestConfig(dataDir);
+    const orchestrator = new GridSyncOrchestrator({ config: cfg, logger: quietLogger });
+    const fakeAdapter = new FakeAdapter(quietLogger);
+    orchestrator.registerAdapter('fake', fakeAdapter);
+    await orchestrator.start();
+
+    fakeAdapter.emitTelemetry(
+      { deviceId: 'alarm-inv-01', deviceType: 'INVERTER', voltage: 280, frequency: 50, soc: 0.5, timestamp: Date.now() },
+      { protocol: 'MQTT', deviceId: 'alarm-inv-01' },
+    );
+    await waitUntil(() => orchestrator.listActiveAlarms().some((a) => a.type === 'OVER_VOLTAGE'), 2000);
+
+    fakeAdapter.emitTelemetry(
+      { deviceId: 'alarm-inv-01', deviceType: 'INVERTER', voltage: 230, frequency: 50, soc: 0.5, timestamp: Date.now() },
+      { protocol: 'MQTT', deviceId: 'alarm-inv-01' },
+    );
+    await waitUntil(() => !orchestrator.listActiveAlarms().some((a) => a.type === 'OVER_VOLTAGE'), 2000);
+
+    await orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('Orchestrator: staleness sweep triggers DEVICE_OFFLINE for a device that has gone silent', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const cfg = makeTestConfig(dataDir, { staleTelemetryMs: 100 });
+    const orchestrator = new GridSyncOrchestrator({ config: cfg, logger: quietLogger });
+    await orchestrator.start();
+
+    orchestrator.circuitBreaker.recordTelemetry('ghost-device', Date.now() - 5000); // long past staleTelemetryMs
+    await orchestrator._sweepStaleness();
+
+    const active = orchestrator.listActiveAlarms();
+    assert.ok(active.some((a) => a.deviceId === 'ghost-device' && a.type === 'DEVICE_OFFLINE'));
+
+    await orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('Orchestrator: issuing RESET acknowledges all active alarms for that device', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const cfg = makeTestConfig(dataDir);
+    const orchestrator = new GridSyncOrchestrator({ config: cfg, logger: quietLogger });
+    const fakeAdapter = new FakeAdapter(quietLogger);
+    orchestrator.registerAdapter('fake', fakeAdapter);
+    await orchestrator.start();
+
+    fakeAdapter.emitTelemetry(
+      { deviceId: 'reset-inv-01', deviceType: 'INVERTER', voltage: 280, frequency: 50, soc: 0.5, timestamp: Date.now() },
+      { protocol: 'MQTT', deviceId: 'reset-inv-01' },
+    );
+    await waitUntil(() => orchestrator.listActiveAlarms().some((a) => a.deviceId === 'reset-inv-01'), 2000);
+
+    await orchestrator.issueManualCommand({ type: 'RESET', deviceId: 'reset-inv-01', issuedBy: 'operator1' });
+
+    const alarm = orchestrator.listActiveAlarms().find((a) => a.deviceId === 'reset-inv-01');
+    assert.ok(alarm, 'alarm should still be active -- RESET acknowledges, does not force-clear an unresolved condition');
+    assert.equal(alarm.acknowledged, true);
+    assert.equal(alarm.acknowledgedBy, 'operator1');
+
+    await orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('ApiServer: GET /api/alarms/active reflects real triggered alarms', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const h = await buildApiHarness(dataDir);
+    const auth = h.authHeader(h.viewerToken);
+
+    h.fakeAdapter.emitTelemetry(
+      { deviceId: 'api-alarm-01', deviceType: 'INVERTER', voltage: 280, frequency: 50, soc: 0.5, timestamp: Date.now() },
+      { protocol: 'MQTT', deviceId: 'api-alarm-01' },
+    );
+    await waitUntil(async () => {
+      const res = await fetch(`${h.base}/api/alarms/active`, { headers: auth });
+      const body = await res.json();
+      return body.alarms.some((a) => a.deviceId === 'api-alarm-01');
+    }, 2000);
+
+    await h.orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('ApiServer: alarm acknowledge is RBAC-gated (403 VIEWER, 200 OPERATOR) and reflected afterward', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const h = await buildApiHarness(dataDir);
+
+    h.fakeAdapter.emitTelemetry(
+      { deviceId: 'api-ack-01', deviceType: 'INVERTER', voltage: 280, frequency: 50, soc: 0.5, timestamp: Date.now() },
+      { protocol: 'MQTT', deviceId: 'api-ack-01' },
+    );
+    let alarmId;
+    await waitUntil(async () => {
+      const res = await fetch(`${h.base}/api/alarms/active`, { headers: h.authHeader(h.viewerToken) });
+      const body = await res.json();
+      const found = body.alarms.find((a) => a.deviceId === 'api-ack-01');
+      if (found) alarmId = found.alarmId;
+      return !!found;
+    }, 2000);
+
+    const asViewer = await fetch(`${h.base}/api/alarms/${alarmId}/acknowledge`, { method: 'POST', headers: h.authHeader(h.viewerToken) });
+    assert.equal(asViewer.status, 403);
+
+    const asOperator = await fetch(`${h.base}/api/alarms/${alarmId}/acknowledge`, { method: 'POST', headers: h.authHeader(h.operatorToken) });
+    assert.equal(asOperator.status, 200);
+
+    const active = await (await fetch(`${h.base}/api/alarms/active`, { headers: h.authHeader(h.viewerToken) })).json();
+    const alarm = active.alarms.find((a) => a.alarmId === alarmId);
+    assert.equal(alarm.acknowledged, true);
+
+    await h.orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('ApiServer: acknowledging an unknown/non-active alarm id returns 404', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const h = await buildApiHarness(dataDir);
+    const res = await fetch(`${h.base}/api/alarms/does-not-exist/acknowledge`, {
+      method: 'POST',
+      headers: h.authHeader(h.operatorToken),
+    });
+    assert.equal(res.status, 404);
+    await h.orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('ApiServer: GET /api/commands/history supports deviceId and status filters', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const h = await buildApiHarness(dataDir);
+    const auth = h.authHeader(h.viewerToken);
+
+    h.fakeAdapter.emitTelemetry(
+      { deviceId: 'filter-dev-01', deviceType: 'INVERTER', voltage: 230, frequency: 50, soc: 0.5, timestamp: Date.now() },
+      { protocol: 'MQTT', deviceId: 'filter-dev-01' },
+    );
+    await waitUntil(() => h.orchestrator.getDeviceDetail('filter-dev-01') !== null, 2000);
+    await h.orchestrator.issueManualCommand({ type: 'STANDBY', deviceId: 'filter-dev-01', issuedBy: 'operator1' });
+    await waitUntil(() => h.fakeAdapter.sentCommands.some((c) => c.deviceId === 'filter-dev-01'), 2000);
+
+    const filtered = await (await fetch(`${h.base}/api/commands/history?deviceId=filter-dev-01`, { headers: auth })).json();
+    assert.ok(filtered.commands.length >= 1);
+    assert.ok(filtered.commands.every((c) => c.deviceId === 'filter-dev-01'));
+
+    await h.orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+
 // Full orchestrator: simulated device inputs -> commands stay within safe params
 // ---------------------------------------------------------------------------
 

@@ -53,6 +53,17 @@ module.exports = {
     maxWalLinesBeforeCompaction: num('GS_WAL_MAX_LINES', 5000),
   },
 
+  // -- Alarm engine --
+  alarms: {
+    // Softer, earlier signal than the circuit breaker's staleTelemetryMs
+    // (DEVICE_OFFLINE) -- COMM_TIMEOUT fires first as a warning.
+    commTimeoutMs: num('GS_COMM_TIMEOUT_MS', 7500),
+    // How often to sweep all known devices for staleness (DEVICE_OFFLINE /
+    // COMM_TIMEOUT can only be detected by absence of telemetry, not by a
+    // triggering event, so this needs a periodic check).
+    stalenessCheckIntervalMs: num('GS_ALARM_CHECK_INTERVAL_MS', 5000),
+  },
+
   // -- Authentication & RBAC --
   auth: {
     // If unset, a random secret is generated per-process at startup (logs a

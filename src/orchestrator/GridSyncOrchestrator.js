@@ -4,6 +4,7 @@ const { IngestionManager } = require('../ingestion/IngestionManager');
 const { StateMachine } = require('../engine/StateMachine');
 const { ConstraintValidator } = require('../engine/ConstraintValidator');
 const { CircuitBreaker } = require('../engine/CircuitBreaker');
+const { AlarmEngine } = require('../engine/AlarmEngine');
 const { CommandQueue } = require('../commands/CommandQueue');
 const { CommandDispatcher } = require('../commands/CommandDispatcher');
 const { FileWalStorage } = require('../storage/FileWalStorage');
@@ -28,6 +29,13 @@ class GridSyncOrchestrator {
     this.storage = this._buildStorage();
     this.userStore = new UserStore({ dataDir: config.storage.dataDir, logger: this.logger });
     this.circuitBreaker = new CircuitBreaker({ ...config.circuitBreaker, logger: this.logger });
+    this.alarmEngine = new AlarmEngine({
+      gridConstraints: config.gridConstraints,
+      commTimeoutMs: config.alarms.commTimeoutMs,
+      staleTelemetryMs: config.circuitBreaker.staleTelemetryMs,
+      logger: this.logger,
+    });
+    this._alarmStalenessTimer = null;
     this.constraintValidator = new ConstraintValidator(config.gridConstraints);
     this.stateMachine = new StateMachine(this.constraintValidator);
     this.commandQueue = new CommandQueue({ storage: this.storage, logger: this.logger });
@@ -117,16 +125,56 @@ class GridSyncOrchestrator {
     const { newState, effects } = this.stateMachine.transition(prevState, point);
     this._deviceStates.set(point.deviceId, newState);
 
+    const alarmEvents = this.alarmEngine.evaluateTelemetry(point);
+    await this._persistAlarmEvents(alarmEvents);
+
     for (const effect of effects) {
       // eslint-disable-next-line no-await-in-loop
       await this.commandQueue.enqueue(effect);
     }
   }
 
+  async _persistAlarmEvents(events) {
+    for (const alarm of events) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await this.storage.appendAlarmEvent(alarm);
+      } catch (err) {
+        this.logger.error('failed to persist alarm event (continuing)', { alarmId: alarm.alarmId, err });
+      }
+    }
+  }
+
   /** Manually issue a command (e.g. operator-initiated curtailment/discharge), same durability guarantees as auto-generated ones. */
   async issueManualCommand({ type, deviceId, value, reason, issuedBy }) {
     assertNonEmptyString(deviceId, 'deviceId');
-    return this.commandQueue.enqueue({ type, deviceId, value, reason: reason || 'MANUAL', issuedBy });
+    const record = await this.commandQueue.enqueue({ type, deviceId, value, reason: reason || 'MANUAL', issuedBy });
+    if (type === 'RESET') {
+      const acknowledged = this.alarmEngine.acknowledgeAllForDevice(deviceId, issuedBy || 'SYSTEM');
+      await this._persistAlarmEvents(acknowledged);
+    }
+    return record;
+  }
+
+  /** Currently active (unresolved) alarms across the whole fleet. */
+  listActiveAlarms() {
+    return this.alarmEngine.listActive();
+  }
+
+  /** Acknowledge one specific active alarm. Returns null if it's not currently active (already cleared, or never existed). */
+  async acknowledgeAlarm(alarmId, byUsername) {
+    const event = this.alarmEngine.acknowledge(alarmId, byUsername);
+    if (event) await this.storage.appendAlarmEvent(event);
+    return event;
+  }
+
+  async _sweepStaleness() {
+    const now = Date.now();
+    for (const { deviceId, lastSeen } of this.circuitBreaker.listTrackedDevices()) {
+      const events = this.alarmEngine.evaluateStaleness(deviceId, lastSeen, now);
+      // eslint-disable-next-line no-await-in-loop
+      await this._persistAlarmEvents(events);
+    }
   }
 
   /** All known devices with their current FSM mode and latest telemetry -- used by the API/dashboard. */
@@ -196,6 +244,13 @@ class GridSyncOrchestrator {
       });
     }
 
+    this._alarmStalenessTimer = setInterval(() => {
+      this._sweepStaleness().catch((err) => {
+        this.logger.error('staleness sweep failed', { err });
+      });
+    }, this.config.alarms.stalenessCheckIntervalMs);
+    this._alarmStalenessTimer.unref?.();
+
     this._started = true;
     this.logger.info('GridSync-OS orchestrator started', {
       adapters: [...this.adapters.keys()],
@@ -205,6 +260,10 @@ class GridSyncOrchestrator {
 
   async stop() {
     if (!this._started) return;
+    if (this._alarmStalenessTimer) {
+      clearInterval(this._alarmStalenessTimer);
+      this._alarmStalenessTimer = null;
+    }
     this.commandDispatcher.stop();
     if (this.apiServer) {
       await this.apiServer.stop().catch((err) => {
@@ -227,6 +286,7 @@ class GridSyncOrchestrator {
       ingestion: this.ingestionManager.getMetrics(),
       circuitBreaker: this.circuitBreaker.getStatus(),
       pendingCommands: this.commandQueue.size(),
+      activeAlarms: this.alarmEngine.listActive().length,
       devices: [...this._deviceStates.values()].map((s) => ({
         deviceId: s.deviceId,
         mode: s.mode,

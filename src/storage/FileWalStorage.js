@@ -18,8 +18,14 @@ const { assertPlainObject, assertNonEmptyString } = require('../utils/validation
  * completion would break the WAL's "later line wins" recovery semantics.
  * All writes to a given file are therefore serialized through a promise
  * chain (`_enqueue`) so writes for that file always land in call order,
- * one at a time -- while a slow write to the *commands* file never blocks
- * a *telemetry* write, since each file has its own independent chain.
+ * one at a time -- while a slow write to one file never blocks a write to
+ * another, since each has its own independent chain.
+ *
+ * Commands and alarms share the exact same shape of need -- an id-keyed
+ * event log where "the latest line for a given id wins" on recovery/query
+ * -- so both are implemented via the same generalized helpers
+ * (`_readLatestStates` / `_appendIdKeyedEvent` / `_compactIdKeyedLog`)
+ * rather than two near-identical copies of the same logic.
  */
 class FileWalStorage extends StorageAdapter {
   constructor({ dataDir, compactionIntervalMs, maxWalLinesBeforeCompaction, logger }) {
@@ -27,38 +33,49 @@ class FileWalStorage extends StorageAdapter {
     this.dataDir = dataDir;
     this.telemetryFile = path.join(dataDir, 'telemetry.jsonl');
     this.commandsFile = path.join(dataDir, 'commands.jsonl');
+    this.alarmsFile = path.join(dataDir, 'alarms.jsonl');
     this.compactionIntervalMs = compactionIntervalMs;
     this.maxWalLinesBeforeCompaction = maxWalLinesBeforeCompaction;
     this.logger = logger ? logger.child('storage:file-wal') : null;
 
     this._telemetryChain = null;
     this._commandChain = null;
+    this._alarmChain = null;
     this._commandLineCount = 0;
+    this._alarmLineCount = 0;
     this._compactionTimer = null;
   }
 
   async init() {
     await fsp.mkdir(this.dataDir, { recursive: true });
-    for (const file of [this.telemetryFile, this.commandsFile]) {
+    for (const file of [this.telemetryFile, this.commandsFile, this.alarmsFile]) {
       try {
         await fsp.access(file);
       } catch {
         await fsp.writeFile(file, '');
       }
     }
-    try {
-      const content = await fsp.readFile(this.commandsFile, 'utf8');
-      this._commandLineCount = content.split('\n').filter(Boolean).length;
-    } catch {
-      this._commandLineCount = 0;
-    }
+    this._commandLineCount = await this._countLines(this.commandsFile);
+    this._alarmLineCount = await this._countLines(this.alarmsFile);
 
     this._compactionTimer = setInterval(() => {
-      this._compactCommands().catch((err) => {
-        if (this.logger) this.logger.error('scheduled compaction failed', { err });
+      this._compactIdKeyedLog('_commandChain', this.commandsFile, 'commandId', 'command').catch((err) => {
+        if (this.logger) this.logger.error('scheduled command WAL compaction failed', { err });
+      });
+      this._compactIdKeyedLog('_alarmChain', this.alarmsFile, 'alarmId', 'alarm').catch((err) => {
+        if (this.logger) this.logger.error('scheduled alarm WAL compaction failed', { err });
       });
     }, this.compactionIntervalMs);
     this._compactionTimer.unref?.();
+  }
+
+  async _countLines(file) {
+    try {
+      const content = await fsp.readFile(file, 'utf8');
+      return content.split('\n').filter(Boolean).length;
+    } catch {
+      return 0;
+    }
   }
 
   async appendTelemetry(point) {
@@ -68,23 +85,38 @@ class FileWalStorage extends StorageAdapter {
   }
 
   async appendCommandEvent(record) {
-    assertPlainObject(record, 'record');
-    if (!record.commandId) {
-      throw new StorageError('appendCommandEvent requires record.commandId', { record });
-    }
-    const line = `${JSON.stringify({ ...record, ts: record.ts || Date.now() })}\n`;
-    const result = await this._enqueue('_commandChain', () => fsp.appendFile(this.commandsFile, line, 'utf8'));
+    const result = await this._appendIdKeyedEvent('_commandChain', this.commandsFile, record, 'commandId');
     this._commandLineCount += 1;
     if (this._commandLineCount >= this.maxWalLinesBeforeCompaction) {
-      this._compactCommands().catch((err) => {
-        if (this.logger) this.logger.error('threshold compaction failed', { err });
+      this._compactIdKeyedLog('_commandChain', this.commandsFile, 'commandId', 'command').catch((err) => {
+        if (this.logger) this.logger.error('threshold command compaction failed', { err });
       });
     }
     return result;
   }
 
+  async appendAlarmEvent(record) {
+    const result = await this._appendIdKeyedEvent('_alarmChain', this.alarmsFile, record, 'alarmId');
+    this._alarmLineCount += 1;
+    if (this._alarmLineCount >= this.maxWalLinesBeforeCompaction) {
+      this._compactIdKeyedLog('_alarmChain', this.alarmsFile, 'alarmId', 'alarm').catch((err) => {
+        if (this.logger) this.logger.error('threshold alarm compaction failed', { err });
+      });
+    }
+    return result;
+  }
+
+  async _appendIdKeyedEvent(chainKey, file, record, idField) {
+    assertPlainObject(record, 'record');
+    if (!record[idField]) {
+      throw new StorageError(`Event record requires .${idField}`, { record });
+    }
+    const line = `${JSON.stringify({ ...record, ts: record.ts || Date.now() })}\n`;
+    return this._enqueue(chainKey, () => fsp.appendFile(file, line, 'utf8'));
+  }
+
   async loadPendingCommands() {
-    const latest = await this._readLatestCommandStates();
+    const latest = await this._readLatestStates(this.commandsFile, 'commandId');
     return Object.values(latest).filter((r) => r.status !== 'ACKED' && r.status !== 'FAILED');
   }
 
@@ -112,46 +144,60 @@ class FileWalStorage extends StorageAdapter {
     return matches.slice(-limit).reverse();
   }
 
-  async queryCommandHistory(limit) {
-    const latest = await this._readLatestCommandStates();
-    const all = Object.values(latest);
+  async queryCommandHistory(limit, filters = {}) {
+    const latest = await this._readLatestStates(this.commandsFile, 'commandId');
+    let all = Object.values(latest);
+    if (filters.deviceId) all = all.filter((r) => r.deviceId === filters.deviceId);
+    if (filters.status) all = all.filter((r) => r.status === filters.status);
     all.sort((a, b) => (b.ts || 0) - (a.ts || 0));
     return all.slice(0, limit);
   }
 
-  async _readLatestCommandStates() {
+  async queryAlarmHistory(limit, filters = {}) {
+    const latest = await this._readLatestStates(this.alarmsFile, 'alarmId');
+    let all = Object.values(latest);
+    if (filters.deviceId) all = all.filter((r) => r.deviceId === filters.deviceId);
+    if (filters.status) all = all.filter((r) => r.status === filters.status);
+    all.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    return all.slice(0, limit);
+  }
+
+  /** Reads an id-keyed WAL file and returns the latest record per id ("later line wins"). */
+  async _readLatestStates(file, idField) {
     let content;
     try {
-      content = await fsp.readFile(this.commandsFile, 'utf8');
+      content = await fsp.readFile(file, 'utf8');
     } catch (err) {
       if (err.code === 'ENOENT') return {};
-      throw new StorageError('Failed to read command WAL', { cause: err.message });
+      throw new StorageError(`Failed to read WAL: ${file}`, { cause: err.message });
     }
     const latest = {};
     for (const line of content.split('\n')) {
       if (!line.trim()) continue;
       try {
         const rec = JSON.parse(line);
-        if (!rec.commandId) continue;
-        latest[rec.commandId] = rec; // later lines overwrite earlier entries: "latest state wins"
+        if (!rec[idField]) continue;
+        latest[rec[idField]] = rec; // later lines overwrite earlier entries: "latest state wins"
       } catch {
         // A single corrupted line (e.g. a partial write from a killed
-        // process) must never prevent recovery of every other command.
-        if (this.logger) this.logger.warn('skipping corrupt WAL line during recovery scan');
+        // process) must never prevent recovery of every other record.
+        if (this.logger) this.logger.warn('skipping corrupt WAL line during scan', { file });
       }
     }
     return latest;
   }
 
-  async _compactCommands() {
-    return this._enqueue('_commandChain', async () => {
-      const latest = await this._readLatestCommandStates();
+  async _compactIdKeyedLog(chainKey, file, idField, label) {
+    return this._enqueue(chainKey, async () => {
+      const latest = await this._readLatestStates(file, idField);
       const lines = Object.values(latest).map((r) => JSON.stringify(r)).join('\n');
-      const tmpFile = `${this.commandsFile}.tmp`;
+      const tmpFile = `${file}.tmp`;
       await fsp.writeFile(tmpFile, lines ? `${lines}\n` : '');
-      await fsp.rename(tmpFile, this.commandsFile); // atomic on POSIX filesystems
-      this._commandLineCount = Object.keys(latest).length;
-      if (this.logger) this.logger.info('command WAL compacted', { records: this._commandLineCount });
+      await fsp.rename(tmpFile, file); // atomic on POSIX filesystems
+      const count = Object.keys(latest).length;
+      if (chainKey === '_commandChain') this._commandLineCount = count;
+      if (chainKey === '_alarmChain') this._alarmLineCount = count;
+      if (this.logger) this.logger.info(`${label} WAL compacted`, { records: count });
     });
   }
 
@@ -172,7 +218,7 @@ class FileWalStorage extends StorageAdapter {
       clearInterval(this._compactionTimer);
       this._compactionTimer = null;
     }
-    await Promise.all([this._telemetryChain, this._commandChain].filter(Boolean));
+    await Promise.all([this._telemetryChain, this._commandChain, this._alarmChain].filter(Boolean));
   }
 }
 

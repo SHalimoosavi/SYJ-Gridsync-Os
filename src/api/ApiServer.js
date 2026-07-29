@@ -151,12 +151,47 @@ class ApiServer {
 
     r.get('/api/commands/history', this._guard('VIEWER', async (req, res, params, query) => {
       const limit = clampLimit(query.get('limit'));
+      const filters = {};
+      if (query.get('deviceId')) filters.deviceId = query.get('deviceId');
+      if (query.get('status')) filters.status = query.get('status');
       try {
-        const commands = await this.orchestrator.storage.queryCommandHistory(limit);
+        const commands = await this.orchestrator.storage.queryCommandHistory(limit, filters);
         this._json(res, 200, { count: commands.length, commands });
       } catch (err) {
         this.logger.error('command history query failed', { err });
         this._json(res, 500, { error: 'Failed to query command history' });
+      }
+    }));
+
+    r.get('/api/alarms/active', this._guard('VIEWER', (req, res) => {
+      this._json(res, 200, { alarms: this.orchestrator.listActiveAlarms() });
+    }));
+
+    r.get('/api/alarms/history', this._guard('VIEWER', async (req, res, params, query) => {
+      const limit = clampLimit(query.get('limit'));
+      const filters = {};
+      if (query.get('deviceId')) filters.deviceId = query.get('deviceId');
+      if (query.get('status')) filters.status = query.get('status');
+      try {
+        const alarms = await this.orchestrator.storage.queryAlarmHistory(limit, filters);
+        this._json(res, 200, { count: alarms.length, alarms });
+      } catch (err) {
+        this.logger.error('alarm history query failed', { err });
+        this._json(res, 500, { error: 'Failed to query alarm history' });
+      }
+    }));
+
+    r.post('/api/alarms/:alarmId/acknowledge', this._guard('OPERATOR', async (req, res, params) => {
+      try {
+        const event = await this.orchestrator.acknowledgeAlarm(params.alarmId, req.authUser.username);
+        if (!event) {
+          this._json(res, 404, { error: `No active alarm with id ${params.alarmId}` });
+          return;
+        }
+        this._json(res, 200, { alarm: event });
+      } catch (err) {
+        this.logger.error('alarm acknowledge failed', { alarmId: params.alarmId, err });
+        this._json(res, 500, { error: 'Failed to acknowledge alarm' });
       }
     }));
 
