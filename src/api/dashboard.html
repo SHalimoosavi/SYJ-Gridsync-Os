@@ -327,6 +327,45 @@
       </table>
       <div class="empty-state" id="commandEmpty" style="display:none;">No commands issued yet.</div>
     </section>
+
+    <section>
+      <h2>Device Registry <span class="count-pill" id="registryPill">0</span></h2>
+      <table id="registryTable">
+        <thead>
+          <tr><th>Device ID</th><th>Name</th><th>Location</th><th>Firmware</th><th>Status</th><th></th></tr>
+        </thead>
+        <tbody id="registryRows"></tbody>
+      </table>
+      <div class="empty-state" id="registryEmpty" style="display:none;">No devices registered yet.</div>
+
+      <div class="panel admin-only" id="deviceForm" style="margin-top: 14px;">
+        <form id="registerForm">
+          <div class="form-row">
+            <div class="form-field">
+              <label for="regDeviceId">Device ID</label>
+              <input type="text" id="regDeviceId" placeholder="inverter-03" required>
+            </div>
+            <div class="form-field">
+              <label for="regName">Name</label>
+              <input type="text" id="regName" placeholder="Rooftop Inverter 3">
+            </div>
+            <div class="form-field">
+              <label for="regLocation">Location</label>
+              <input type="text" id="regLocation" placeholder="Building A roof">
+            </div>
+            <div class="form-field">
+              <label for="regFirmware">Firmware</label>
+              <input type="text" id="regFirmware" placeholder="v2.1.0">
+            </div>
+          </div>
+          <div class="form-actions" style="display:flex; gap:10px; align-items:center;">
+            <button type="submit" id="regSubmit">Register Device</button>
+            <button type="button" class="secondary" id="regCancelEdit" style="display:none;">Cancel Edit</button>
+          </div>
+          <div class="toast" id="regToast"></div>
+        </form>
+      </div>
+    </section>
   </main>
 
   <footer>Auto-refreshing every 3s · <a href="/api/snapshot">raw snapshot</a></footer>
@@ -518,6 +557,154 @@
     const isOperatorPlus = role === 'OPERATOR' || role === 'ADMIN';
     commandCenter.style.display = isOperatorPlus ? '' : 'none';
     viewerNotice.style.display = isOperatorPlus ? 'none' : '';
+
+    const deviceForm = document.getElementById('deviceForm');
+    deviceForm.style.display = role === 'ADMIN' ? '' : 'none';
+  }
+
+  // ---- Device Registry ----
+  let editingDeviceId = null; // null = register mode; set = edit mode
+
+  function resetDeviceForm() {
+    editingDeviceId = null;
+    document.getElementById('regDeviceId').value = '';
+    document.getElementById('regDeviceId').disabled = false;
+    document.getElementById('regName').value = '';
+    document.getElementById('regLocation').value = '';
+    document.getElementById('regFirmware').value = '';
+    document.getElementById('regSubmit').textContent = 'Register Device';
+    document.getElementById('regCancelEdit').style.display = 'none';
+  }
+
+  function beginEditDevice(device) {
+    editingDeviceId = device.deviceId;
+    document.getElementById('regDeviceId').value = device.deviceId;
+    document.getElementById('regDeviceId').disabled = true; // device id is immutable once registered
+    document.getElementById('regName').value = device.name || '';
+    document.getElementById('regLocation').value = device.location || '';
+    document.getElementById('regFirmware').value = device.firmwareVersion || '';
+    document.getElementById('regSubmit').textContent = 'Save Changes';
+    document.getElementById('regCancelEdit').style.display = '';
+    document.getElementById('deviceForm').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
+  document.getElementById('regCancelEdit').addEventListener('click', resetDeviceForm);
+
+  document.getElementById('registerForm').addEventListener('submit', async function (e) {
+    e.preventDefault();
+    const toast = document.getElementById('regToast');
+    toast.textContent = '';
+    toast.className = 'toast';
+    const name = document.getElementById('regName').value;
+    const location = document.getElementById('regLocation').value;
+    const firmwareVersion = document.getElementById('regFirmware').value;
+
+    try {
+      let res;
+      if (editingDeviceId) {
+        res = await authFetch('/api/devices/' + encodeURIComponent(editingDeviceId), {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: name, location: location, firmwareVersion: firmwareVersion }),
+        });
+      } else {
+        const deviceId = document.getElementById('regDeviceId').value;
+        if (!deviceId) { toast.textContent = 'Device ID is required.'; toast.className = 'toast err'; return; }
+        res = await authFetch('/api/devices', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ deviceId: deviceId, name: name, location: location, firmwareVersion: firmwareVersion }),
+        });
+      }
+      const body = await res.json();
+      if (res.ok) {
+        toast.textContent = editingDeviceId ? 'Device updated.' : 'Device registered.';
+        toast.className = 'toast ok';
+        resetDeviceForm();
+        refreshRegistry();
+      } else {
+        toast.textContent = body.error || ('Failed: HTTP ' + res.status);
+        toast.className = 'toast err';
+      }
+    } catch (err) {
+      toast.textContent = "Can't reach GridSync-OS";
+      toast.className = 'toast err';
+    }
+  });
+
+  function statusPillClass(status) {
+    if (status === 'ENABLED') return 'ACKED';
+    if (status === 'DISABLED') return 'PENDING';
+    return 'FAILED'; // REMOVED
+  }
+
+  function renderRegistry(devices) {
+    const tbody = document.getElementById('registryRows');
+    const empty = document.getElementById('registryEmpty');
+    document.getElementById('registryPill').textContent = String(devices.length);
+    if (!devices.length) { tbody.innerHTML = ''; empty.style.display = 'block'; return; }
+    empty.style.display = 'none';
+    const isAdmin = currentRole === 'ADMIN';
+
+    tbody.innerHTML = devices.map(function (d) {
+      let actions = '';
+      if (isAdmin) {
+        actions += '<button class="small secondary" data-edit="' + escapeHtml(d.deviceId) + '">Edit</button> ';
+        if (d.status === 'ENABLED') {
+          actions += '<button class="small secondary" data-disable="' + escapeHtml(d.deviceId) + '">Disable</button> ';
+        } else {
+          actions += '<button class="small secondary" data-enable="' + escapeHtml(d.deviceId) + '">Enable</button> ';
+        }
+        actions += '<button class="small secondary" data-remove="' + escapeHtml(d.deviceId) + '">Remove</button>';
+      }
+      return '<tr>' +
+        '<td>' + escapeHtml(d.deviceId) + '</td>' +
+        '<td>' + escapeHtml(d.name) + '</td>' +
+        '<td>' + escapeHtml(d.location || '–') + '</td>' +
+        '<td>' + escapeHtml(d.firmwareVersion || '–') + '</td>' +
+        '<td><span class="pill ' + statusPillClass(d.status) + '">' + escapeHtml(d.status) + '</span></td>' +
+        '<td>' + actions + '</td>' +
+        '</tr>';
+    }).join('');
+
+    if (!isAdmin) return;
+    const byId = {};
+    devices.forEach(function (d) { byId[d.deviceId] = d; });
+
+    tbody.querySelectorAll('button[data-edit]').forEach(function (btn) {
+      btn.addEventListener('click', function () { beginEditDevice(byId[btn.getAttribute('data-edit')]); });
+    });
+    tbody.querySelectorAll('button[data-enable]').forEach(function (btn) {
+      btn.addEventListener('click', async function () {
+        await authFetch('/api/devices/' + encodeURIComponent(btn.getAttribute('data-enable')) + '/enable', { method: 'POST' });
+        refreshRegistry();
+      });
+    });
+    tbody.querySelectorAll('button[data-disable]').forEach(function (btn) {
+      btn.addEventListener('click', async function () {
+        await authFetch('/api/devices/' + encodeURIComponent(btn.getAttribute('data-disable')) + '/disable', { method: 'POST' });
+        refreshRegistry();
+      });
+    });
+    tbody.querySelectorAll('button[data-remove]').forEach(function (btn) {
+      btn.addEventListener('click', async function () {
+        const deviceId = btn.getAttribute('data-remove');
+        if (!confirm('Remove ' + deviceId + '? Its future telemetry will be dropped until re-enabled.')) return;
+        await authFetch('/api/devices/' + encodeURIComponent(deviceId), { method: 'DELETE' });
+        refreshRegistry();
+      });
+    });
+  }
+
+  async function refreshRegistry() {
+    try {
+      const res = await authFetch('/api/devices/registry');
+      if (!res.ok) return;
+      const body = await res.json();
+      renderRegistry(body.devices);
+    } catch (err) {
+      // non-critical -- leave last good render in place
+    }
   }
 
   // ---- Charts (hand-rolled SVG, no charting library / no external calls) ----
@@ -666,6 +853,7 @@
       renderCommands(historyData.commands);
       renderAlarms(alarmsData.alarms);
       refreshCharts();
+      refreshRegistry();
 
       connBanner.classList.remove('visible');
     } catch (err) {

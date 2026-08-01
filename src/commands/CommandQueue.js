@@ -154,10 +154,28 @@ class CommandQueue extends EventEmitter {
       return 'FAILED';
     }
 
-    record.status = 'PENDING'; // eligible for retry
+    record.status = 'PENDING'; // eligible for retry once requeueForRetry() is called
     await this._persist(record, 'RETRY_SCHEDULED');
-    this._pendingOrder.push(commandId);
+    // Deliberately NOT pushed onto _pendingOrder here. _pump()'s while loop
+    // is typically still actively running when this is called (it's what
+    // invoked _handleOne, which invoked this) -- pushing immediately would
+    // make the command eligible for takeNextPending() again in that same
+    // loop iteration, completely bypassing the dispatcher's backoff delay.
+    // The dispatcher is responsible for calling requeueForRetry() only
+    // once its backoff timer actually elapses.
     return 'RETRY_SCHEDULED';
+  }
+
+  /**
+   * Makes a command eligible for pickup again after a retry backoff delay
+   * has actually elapsed. Called by the dispatcher's backoff timer, never
+   * synchronously from markFailedAttempt -- see the comment there.
+   */
+  requeueForRetry(commandId) {
+    const record = this._records.get(commandId);
+    if (!record || record.status !== 'PENDING') return; // already handled/removed/terminal in the meantime
+    this._pendingOrder.push(commandId);
+    this.emit('ready');
   }
 
   async _persist(record, event) {

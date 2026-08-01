@@ -116,6 +116,11 @@ class UserStore {
       return sanitize(user);
     });
   }
+
+  /** Waits for any in-flight write to finish. Call before tearing down the process/data directory -- this write chain is independent of FileWalStorage's. */
+  async close() {
+    await this._writeChain;
+  }
 }
 
 function sanitize(user) {

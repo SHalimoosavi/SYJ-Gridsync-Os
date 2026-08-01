@@ -19,10 +19,11 @@ const { AdapterError } = require('../utils/errors');
  *    in two simultaneous sendCommand() calls for one commandId.
  */
 class CommandDispatcher {
-  constructor({ queue, circuitBreaker, constraintValidator, resolveAdapter, getLatestState, config, logger }) {
+  constructor({ queue, circuitBreaker, constraintValidator, deviceRegistry, resolveAdapter, getLatestState, config, logger }) {
     this.queue = queue;
     this.circuitBreaker = circuitBreaker;
     this.constraintValidator = constraintValidator;
+    this.deviceRegistry = deviceRegistry;
     this.resolveAdapter = resolveAdapter;
     this.getLatestState = getLatestState;
     this.config = config;
@@ -67,6 +68,17 @@ class CommandDispatcher {
     this._inFlight.add(commandId);
 
     try {
+      if (this.deviceRegistry && !this.deviceRegistry.canReceiveCommands(record.deviceId)) {
+        this.logger.warn('command blocked: device is disabled or removed', { commandId, deviceId: record.deviceId });
+        const outcome = await this.queue.markFailedAttempt(
+          commandId,
+          'DEVICE_DISABLED_OR_REMOVED',
+          { maxAttempts: this.config.commandQueue.maxAttempts },
+        );
+        if (outcome === 'RETRY_SCHEDULED') this._scheduleRetryWake(commandId, record.attempts);
+        return;
+      }
+
       const breakerCheck = this.circuitBreaker.isOpen(record.deviceId);
       if (breakerCheck.open) {
         this.logger.warn('command blocked by circuit breaker', {
@@ -79,7 +91,7 @@ class CommandDispatcher {
           `CIRCUIT_OPEN:${breakerCheck.reason}`,
           { maxAttempts: this.config.commandQueue.maxAttempts },
         );
-        if (outcome === 'RETRY_SCHEDULED') this._scheduleRetryWake(record.attempts);
+        if (outcome === 'RETRY_SCHEDULED') this._scheduleRetryWake(commandId, record.attempts);
         return;
       }
 
@@ -115,19 +127,24 @@ class CommandDispatcher {
       const outcome = await this.queue.markFailedAttempt(commandId, err.message, {
         maxAttempts: this.config.commandQueue.maxAttempts,
       });
-      if (outcome === 'RETRY_SCHEDULED') this._scheduleRetryWake(record.attempts);
+      if (outcome === 'RETRY_SCHEDULED') this._scheduleRetryWake(commandId, record.attempts);
     } finally {
       this._inFlight.delete(commandId);
     }
   }
 
-  _scheduleRetryWake(attemptNumber) {
+  _scheduleRetryWake(commandId, attemptNumber) {
     if (this._stopped) return;
     const { baseRetryDelayMs, maxRetryDelayMs } = this.config.commandQueue;
     const delay = Math.min(maxRetryDelayMs, baseRetryDelayMs * 2 ** Math.max(0, attemptNumber - 1));
     const timer = setTimeout(() => {
       this._retryTimers.delete(timer);
-      this._pump();
+      // requeueForRetry() puts the command back into the pending order and
+      // emits 'ready', which triggers _pump() -- this is the actual gate
+      // on backoff timing. Calling _pump() directly here (as an earlier
+      // version did) would be a no-op if the command hadn't been requeued
+      // yet, so this ordering matters.
+      this.queue.requeueForRetry(commandId);
     }, delay);
     timer.unref?.();
     this._retryTimers.add(timer);

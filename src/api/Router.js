@@ -36,6 +36,14 @@ class Router {
     this.add('POST', pattern, handler);
   }
 
+  patch(pattern, handler) {
+    this.add('PATCH', pattern, handler);
+  }
+
+  delete(pattern, handler) {
+    this.add('DELETE', pattern, handler);
+  }
+
   /**
    * @returns {{handler: Function, params: Object<string,string>}|null}
    */

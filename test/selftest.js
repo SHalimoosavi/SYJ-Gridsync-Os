@@ -16,6 +16,7 @@ const { ConstraintValidator } = require('../src/engine/ConstraintValidator');
 const { CircuitBreaker } = require('../src/engine/CircuitBreaker');
 const { StateMachine, MODES } = require('../src/engine/StateMachine');
 const { AlarmEngine } = require('../src/engine/AlarmEngine');
+const { DeviceRegistry } = require('../src/devices/DeviceRegistry');
 const { CommandQueue } = require('../src/commands/CommandQueue');
 const { CommandDispatcher } = require('../src/commands/CommandDispatcher');
 const { FileWalStorage } = require('../src/storage/FileWalStorage');
@@ -39,8 +40,21 @@ async function mkTempDir() {
   return fsp.mkdtemp(path.join(os.tmpdir(), 'gridsync-selftest-'));
 }
 
-async function rmTempDir(dir) {
-  await fsp.rm(dir, { recursive: true, force: true });
+async function rmTempDir(dir, attemptsLeft = 5) {
+  try {
+    await fsp.rm(dir, { recursive: true, force: true });
+  } catch (err) {
+    if (err.code === 'ENOTEMPTY' && attemptsLeft > 0) {
+      // A background write (e.g. a fire-and-forget persistence call) can
+      // occasionally still be landing on disk a few ms after stop()
+      // resolves. Retrying briefly is standard practice for this class of
+      // teardown race and does not mask a production issue -- production
+      // code never calls this function.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return rmTempDir(dir, attemptsLeft - 1);
+    }
+    throw err;
+  }
 }
 
 async function waitUntil(predicate, timeoutMs = 2000, intervalMs = 10) {
@@ -614,6 +628,8 @@ async function buildDispatcherHarness(dataDir, overrides = {}) {
   const queue = new CommandQueue({ storage, logger: quietLogger });
   const circuitBreaker = new CircuitBreaker({ ...cfg.circuitBreaker, logger: quietLogger });
   const constraintValidator = new ConstraintValidator(cfg.gridConstraints);
+  const deviceRegistry = new DeviceRegistry({ dataDir, logger: quietLogger });
+  await deviceRegistry.init();
   const adapter = new FakeAdapter(quietLogger);
   const latestStates = new Map();
 
@@ -621,6 +637,7 @@ async function buildDispatcherHarness(dataDir, overrides = {}) {
     queue,
     circuitBreaker,
     constraintValidator,
+    deviceRegistry,
     resolveAdapter: () => adapter,
     getLatestState: (deviceId) => latestStates.get(deviceId) || null,
     config: cfg,
@@ -628,7 +645,7 @@ async function buildDispatcherHarness(dataDir, overrides = {}) {
   });
   dispatcher.start();
 
-  return { cfg, storage, queue, circuitBreaker, constraintValidator, adapter, latestStates, dispatcher };
+  return { cfg, storage, queue, circuitBreaker, constraintValidator, deviceRegistry, adapter, latestStates, dispatcher };
 }
 
 test('CommandDispatcher: blocks commands to a device with stale/no telemetry via the circuit breaker', async () => {
@@ -640,6 +657,59 @@ test('CommandDispatcher: blocks commands to a device with stale/no telemetry via
 
     await waitUntil(() => h.queue.size() === 0, 1000);
     assert.equal(h.adapter.sentCommands.length, 0, 'a breaker-blocked command must never reach the adapter');
+
+    h.dispatcher.stop();
+    await h.storage.close();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('CommandDispatcher: DISABLED device blocks dispatch (retryable); re-enabling lets a pending retry through', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    // maxAttempts is deliberately generous: with a 15-30ms backoff, a small
+    // maxAttempts would exhaust the retry budget (permanent FAILED) in well
+    // under 100ms -- faster than this test could re-enable the device and
+    // still observe a pending retry succeed. This isn't a hypothetical --
+    // an earlier version of this test used maxAttempts:5 and failed for
+    // exactly that reason (confirmed via a standalone repro).
+    const h = await buildDispatcherHarness(dataDir, { maxAttempts: 200, baseRetryDelayMs: 15, maxRetryDelayMs: 30 });
+    h.circuitBreaker.recordTelemetry('inv-disabled', Date.now());
+    await h.deviceRegistry.register({ deviceId: 'inv-disabled' });
+    await h.deviceRegistry.setStatus('inv-disabled', 'DISABLED');
+
+    await h.queue.enqueue({ type: 'CURTAIL', deviceId: 'inv-disabled', value: 10 });
+    await new Promise((resolve) => setTimeout(resolve, 60)); // let a couple of retry attempts happen
+    assert.equal(h.adapter.sentCommands.length, 0, 'a disabled device must never actually receive the command');
+    // Note: queue.size() reflects only commands immediately eligible for
+    // pickup, not ones currently waiting out a backoff delay -- use
+    // listPending() (all non-terminal records) to check it hasn't been
+    // permanently FAILED yet.
+    assert.ok(h.queue.listPending().some((c) => c.deviceId === 'inv-disabled'), 'command must still be pending, not exhausted, at this point');
+
+    await h.deviceRegistry.setStatus('inv-disabled', 'ENABLED');
+    await waitUntil(() => h.adapter.sentCommands.length === 1, 2000);
+
+    h.dispatcher.stop();
+    await h.storage.close();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('CommandDispatcher: REMOVED device also blocks dispatch', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const h = await buildDispatcherHarness(dataDir, { maxAttempts: 2, baseRetryDelayMs: 15, maxRetryDelayMs: 30 });
+    h.circuitBreaker.recordTelemetry('inv-removed', Date.now());
+    await h.deviceRegistry.register({ deviceId: 'inv-removed' });
+    await h.deviceRegistry.setStatus('inv-removed', 'REMOVED');
+
+    await h.queue.enqueue({ type: 'STANDBY', deviceId: 'inv-removed', value: 0 });
+    await waitUntil(() => h.queue.size() === 0, 1000); // exhausts retries and fails
+
+    assert.equal(h.adapter.sentCommands.length, 0);
 
     h.dispatcher.stop();
     await h.storage.close();
@@ -1026,8 +1096,96 @@ test('UserStore: rejects passwords shorter than 8 characters', async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Router: path matching + :param extraction, tested independent of HTTP
+// DeviceRegistry: metadata/control overlay, in-memory-cache read path
 // ---------------------------------------------------------------------------
+
+test('DeviceRegistry: ensureRegistered creates on first call, is idempotent afterward', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const registry = new DeviceRegistry({ dataDir, logger: quietLogger });
+    await registry.init();
+    const first = await registry.ensureRegistered('inv-01', { name: 'inv-01' });
+    assert.equal(first.status, 'ENABLED');
+    assert.equal(first.autoRegistered, true);
+
+    const second = await registry.ensureRegistered('inv-01', { name: 'should-be-ignored' });
+    assert.equal(second.name, 'inv-01', 'second call must not overwrite the existing record');
+    assert.equal(registry.list().length, 1);
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('DeviceRegistry: register() rejects a duplicate deviceId; update()/setStatus() work and validate existence', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const registry = new DeviceRegistry({ dataDir, logger: quietLogger });
+    await registry.init();
+    await registry.register({ deviceId: 'inv-01', name: 'Inverter One', location: 'Roof A' });
+    await assert.rejects(() => registry.register({ deviceId: 'inv-01', name: 'dup' }));
+
+    const updated = await registry.update('inv-01', { firmwareVersion: 'v1.2.3' });
+    assert.equal(updated.firmwareVersion, 'v1.2.3');
+    assert.equal(updated.name, 'Inverter One', 'unspecified fields are left unchanged');
+    await assert.rejects(() => registry.update('unknown-device', { name: 'x' }));
+
+    const disabled = await registry.setStatus('inv-01', 'DISABLED');
+    assert.equal(disabled.status, 'DISABLED');
+    await assert.rejects(() => registry.setStatus('unknown-device', 'ENABLED'));
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('DeviceRegistry: remove is a soft-delete (REMOVED status); blocks telemetry and edits, but list() excludes it by default', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const registry = new DeviceRegistry({ dataDir, logger: quietLogger });
+    await registry.init();
+    await registry.register({ deviceId: 'inv-01' });
+    assert.equal(registry.isBlocked('inv-01'), false);
+
+    await registry.setStatus('inv-01', 'REMOVED');
+    assert.equal(registry.isBlocked('inv-01'), true);
+    assert.equal(registry.canReceiveCommands('inv-01'), false);
+    await assert.rejects(() => registry.update('inv-01', { name: 'x' }), /removed/i);
+
+    assert.equal(registry.list().length, 0, 'REMOVED devices excluded by default');
+    assert.equal(registry.list({ includeRemoved: true }).length, 1);
+
+    // Re-enabling restores it.
+    await registry.setStatus('inv-01', 'ENABLED');
+    assert.equal(registry.isBlocked('inv-01'), false);
+    assert.equal(registry.list().length, 1);
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('DeviceRegistry: canReceiveCommands is true for an unregistered deviceId (registry never blocks by omission)', () => {
+  const registry = new DeviceRegistry({ dataDir: '/tmp/unused-for-this-test', logger: quietLogger });
+  assert.equal(registry.canReceiveCommands('never-seen-device'), true);
+  assert.equal(registry.isBlocked('never-seen-device'), false);
+});
+
+test('DeviceRegistry: state persists and reloads correctly across a simulated restart', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const registry1 = new DeviceRegistry({ dataDir, logger: quietLogger });
+    await registry1.init();
+    await registry1.register({ deviceId: 'inv-01', name: 'Inverter One', firmwareVersion: 'v1.0.0' });
+    await registry1.setStatus('inv-01', 'DISABLED');
+
+    const registry2 = new DeviceRegistry({ dataDir, logger: quietLogger });
+    await registry2.init();
+    const reloaded = registry2.get('inv-01');
+    assert.equal(reloaded.name, 'Inverter One');
+    assert.equal(reloaded.firmwareVersion, 'v1.0.0');
+    assert.equal(reloaded.status, 'DISABLED');
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
 
 test('Router: matches a static route and rejects wrong method', () => {
   const r = new Router();
@@ -1599,6 +1757,212 @@ test('ApiServer: GET /api/commands/history supports deviceId and status filters'
     const filtered = await (await fetch(`${h.base}/api/commands/history?deviceId=filter-dev-01`, { headers: auth })).json();
     assert.ok(filtered.commands.length >= 1);
     assert.ok(filtered.commands.every((c) => c.deviceId === 'filter-dev-01'));
+
+    await h.orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// v0.5.0: Device Management -- orchestrator integration + API RBAC/CRUD
+// ---------------------------------------------------------------------------
+
+test('Orchestrator: telemetry auto-registers a new device in the registry', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const cfg = makeTestConfig(dataDir);
+    const orchestrator = new GridSyncOrchestrator({ config: cfg, logger: quietLogger });
+    const fakeAdapter = new FakeAdapter(quietLogger);
+    orchestrator.registerAdapter('fake', fakeAdapter);
+    await orchestrator.start();
+
+    fakeAdapter.emitTelemetry(
+      { deviceId: 'auto-reg-01', deviceType: 'INVERTER', voltage: 230, frequency: 50, soc: 0.5, timestamp: Date.now() },
+      { protocol: 'MQTT', deviceId: 'auto-reg-01' },
+    );
+    await waitUntil(() => orchestrator.deviceRegistry.get('auto-reg-01') !== null, 2000);
+    assert.equal(orchestrator.deviceRegistry.get('auto-reg-01').status, 'ENABLED');
+
+    await orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('Orchestrator: telemetry from a REMOVED device is dropped, not reprocessed', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const cfg = makeTestConfig(dataDir);
+    const orchestrator = new GridSyncOrchestrator({ config: cfg, logger: quietLogger });
+    const fakeAdapter = new FakeAdapter(quietLogger);
+    orchestrator.registerAdapter('fake', fakeAdapter);
+    await orchestrator.start();
+    await orchestrator.deviceRegistry.register({ deviceId: 'removed-dev-01' });
+    await orchestrator.deviceRegistry.setStatus('removed-dev-01', 'REMOVED');
+
+    const before = orchestrator.getSnapshot().blockedTelemetry;
+    fakeAdapter.emitTelemetry(
+      { deviceId: 'removed-dev-01', deviceType: 'INVERTER', voltage: 230, frequency: 50, soc: 0.5, timestamp: Date.now() },
+      { protocol: 'MQTT', deviceId: 'removed-dev-01' },
+    );
+    await waitUntil(() => orchestrator.getSnapshot().blockedTelemetry > before, 2000);
+
+    assert.equal(orchestrator.getDeviceDetail('removed-dev-01'), null, 'telemetry must never have been processed into device state');
+
+    await orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('Orchestrator: removeDevice() clears live state immediately (disappears from listDevices/getDeviceDetail)', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const cfg = makeTestConfig(dataDir);
+    const orchestrator = new GridSyncOrchestrator({ config: cfg, logger: quietLogger });
+    const fakeAdapter = new FakeAdapter(quietLogger);
+    orchestrator.registerAdapter('fake', fakeAdapter);
+    await orchestrator.start();
+
+    fakeAdapter.emitTelemetry(
+      { deviceId: 'to-remove-01', deviceType: 'INVERTER', voltage: 230, frequency: 50, soc: 0.5, timestamp: Date.now() },
+      { protocol: 'MQTT', deviceId: 'to-remove-01' },
+    );
+    await waitUntil(() => orchestrator.getDeviceDetail('to-remove-01') !== null, 2000);
+
+    await orchestrator.removeDevice('to-remove-01');
+    assert.equal(orchestrator.getDeviceDetail('to-remove-01'), null);
+    assert.ok(!orchestrator.listDevices().some((d) => d.deviceId === 'to-remove-01'));
+    // But it's still visible in the audit trail if explicitly requested.
+    assert.ok(orchestrator.listRegisteredDevices({ includeRemoved: true }).some((d) => d.deviceId === 'to-remove-01'));
+
+    await orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('Orchestrator: disabling a device blocks auto-generated FSM commands too (not just manual ones)', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const cfg = makeTestConfig(dataDir);
+    const orchestrator = new GridSyncOrchestrator({ config: cfg, logger: quietLogger });
+    const fakeAdapter = new FakeAdapter(quietLogger);
+    orchestrator.registerAdapter('fake', fakeAdapter);
+    await orchestrator.start();
+
+    fakeAdapter.emitTelemetry(
+      { deviceId: 'disabled-fsm-01', deviceType: 'INVERTER', voltage: 230, frequency: 50, soc: 0.5, timestamp: Date.now() },
+      { protocol: 'MQTT', deviceId: 'disabled-fsm-01' },
+    );
+    await waitUntil(() => orchestrator.getDeviceDetail('disabled-fsm-01') !== null, 2000);
+    await orchestrator.setDeviceStatus('disabled-fsm-01', 'DISABLED');
+
+    // Overvoltage would normally trigger an auto-CURTAIL command via the state machine.
+    fakeAdapter.emitTelemetry(
+      { deviceId: 'disabled-fsm-01', deviceType: 'INVERTER', voltage: 270, frequency: 50, soc: 0.5, timestamp: Date.now() },
+      { protocol: 'MQTT', deviceId: 'disabled-fsm-01' },
+    );
+    await waitUntil(() => orchestrator.commandQueue.size() === 0, 2000); // the attempt fails/retries out, queue drains
+
+    assert.equal(fakeAdapter.sentCommands.length, 0, 'a disabled device must not receive even an auto-generated safety command');
+
+    await orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('ApiServer: GET /api/devices/registry is not shadowed by the /api/devices/:deviceId route', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const h = await buildApiHarness(dataDir);
+    const res = await fetch(`${h.base}/api/devices/registry`, { headers: h.authHeader(h.viewerToken) });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.ok(Array.isArray(body.devices), '"registry" must not be captured as a literal deviceId by the :deviceId route');
+    await h.orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('ApiServer: device registry CRUD is ADMIN-gated end-to-end (register, update, enable/disable, remove)', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const h = await buildApiHarness(dataDir);
+    const adminAuth = { 'Content-Type': 'application/json', ...h.authHeader(h.adminToken) };
+    const operatorAuth = { 'Content-Type': 'application/json', ...h.authHeader(h.operatorToken) };
+
+    // OPERATOR cannot register a device.
+    const asOperator = await fetch(`${h.base}/api/devices`, { method: 'POST', headers: operatorAuth, body: JSON.stringify({ deviceId: 'crud-dev-01' }) });
+    assert.equal(asOperator.status, 403);
+
+    // ADMIN registers it.
+    const registerRes = await fetch(`${h.base}/api/devices`, {
+      method: 'POST',
+      headers: adminAuth,
+      body: JSON.stringify({ deviceId: 'crud-dev-01', name: 'Test Device', location: 'Lab' }),
+    });
+    assert.equal(registerRes.status, 201);
+
+    // Duplicate registration fails.
+    const dupRes = await fetch(`${h.base}/api/devices`, { method: 'POST', headers: adminAuth, body: JSON.stringify({ deviceId: 'crud-dev-01' }) });
+    assert.equal(dupRes.status, 400);
+
+    // ADMIN updates metadata.
+    const patchRes = await fetch(`${h.base}/api/devices/crud-dev-01`, {
+      method: 'PATCH',
+      headers: adminAuth,
+      body: JSON.stringify({ firmwareVersion: 'v3.0.0' }),
+    });
+    assert.equal(patchRes.status, 200);
+    const patched = await patchRes.json();
+    assert.equal(patched.device.firmwareVersion, 'v3.0.0');
+
+    // OPERATOR cannot disable.
+    const disableAsOperator = await fetch(`${h.base}/api/devices/crud-dev-01/disable`, { method: 'POST', headers: operatorAuth });
+    assert.equal(disableAsOperator.status, 403);
+
+    // ADMIN disables, then re-enables.
+    const disableRes = await fetch(`${h.base}/api/devices/crud-dev-01/disable`, { method: 'POST', headers: adminAuth });
+    assert.equal(disableRes.status, 200);
+    assert.equal((await disableRes.json()).device.status, 'DISABLED');
+
+    const enableRes = await fetch(`${h.base}/api/devices/crud-dev-01/enable`, { method: 'POST', headers: adminAuth });
+    assert.equal((await enableRes.json()).device.status, 'ENABLED');
+
+    // ADMIN removes it; it drops out of the default registry listing.
+    const removeRes = await fetch(`${h.base}/api/devices/crud-dev-01`, { method: 'DELETE', headers: adminAuth });
+    assert.equal(removeRes.status, 200);
+
+    const registryList = await (await fetch(`${h.base}/api/devices/registry`, { headers: h.authHeader(h.viewerToken) })).json();
+    assert.ok(!registryList.devices.some((d) => d.deviceId === 'crud-dev-01'));
+
+    const withRemoved = await (await fetch(`${h.base}/api/devices/registry?includeRemoved=true`, { headers: h.authHeader(h.viewerToken) })).json();
+    assert.ok(withRemoved.devices.some((d) => d.deviceId === 'crud-dev-01' && d.status === 'REMOVED'));
+
+    await h.orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('ApiServer: PATCH/enable/disable/DELETE on an unregistered deviceId return 404', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const h = await buildApiHarness(dataDir);
+    const adminAuth = { 'Content-Type': 'application/json', ...h.authHeader(h.adminToken) };
+
+    const patchRes = await fetch(`${h.base}/api/devices/nope`, { method: 'PATCH', headers: adminAuth, body: JSON.stringify({ name: 'x' }) });
+    assert.equal(patchRes.status, 404);
+
+    const enableRes = await fetch(`${h.base}/api/devices/nope/enable`, { method: 'POST', headers: adminAuth });
+    assert.equal(enableRes.status, 404);
+
+    const removeRes = await fetch(`${h.base}/api/devices/nope`, { method: 'DELETE', headers: adminAuth });
+    assert.equal(removeRes.status, 404);
 
     await h.orchestrator.stop();
   } finally {

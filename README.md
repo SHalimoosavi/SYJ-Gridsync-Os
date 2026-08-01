@@ -11,14 +11,15 @@
 <br/>
 
 ![Node.js](https://img.shields.io/badge/Node.js-%E2%89%A518-green?logo=node.js&logoColor=white)
-![Version](https://img.shields.io/badge/Version-v0.4.0-blueviolet)
+![Version](https://img.shields.io/badge/Version-v0.5.0-blueviolet)
 ![License](https://img.shields.io/badge/License-Proprietary-blue)
-![Tests](https://img.shields.io/badge/Self--Tests-79%20Passing-success?logo=checkmarx&logoColor=white)
+![Tests](https://img.shields.io/badge/Self--Tests-93%20Passing-success?logo=checkmarx&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Termux%20%7C%20Linux%20%7C%20Windows-orange)
 ![MQTT](https://img.shields.io/badge/MQTT-Supported-660066?logo=mqtt&logoColor=white)
 ![API](https://img.shields.io/badge/REST%20API-Dashboard%20%2B%20Endpoints-informational)
 ![Auth](https://img.shields.io/badge/Auth-JWT%20%2B%20RBAC-critical)
 ![Alarms](https://img.shields.io/badge/Alarm%20Engine-6%20Types-yellow)
+![Devices](https://img.shields.io/badge/Device%20Management-Registry%20%2B%20RBAC-lightgrey)
 ![Industrial](https://img.shields.io/badge/Industrial-IIoT-red)
 ![Dependencies](https://img.shields.io/badge/Native%20Deps-Zero-blueviolet)
 
@@ -39,6 +40,7 @@
 - [REST API & Monitoring Dashboard](#rest-api--monitoring-dashboard)
 - [Authentication & RBAC](#authentication--rbac)
 - [Operations Console (v0.4.0)](#operations-console-v040)
+- [Device Management (v0.5.0)](#device-management-v050)
 - [Project Structure](#project-structure)
 - [Getting Started (Termux)](#getting-started-termux)
 - [Initializing Your Own Git Repository](#initializing-your-own-git-repository)
@@ -202,8 +204,14 @@ Open that URL in a browser for a live view of device fleet status (voltage/frequ
 | POST | `/api/auth/logout` | VIEWER | Revokes the current token |
 | GET | `/api/auth/me` | VIEWER | Current authenticated user's identity |
 | GET | `/api/snapshot` | VIEWER | Full system snapshot (ingestion metrics, breaker status, pending count, device modes) |
-| GET | `/api/devices` | VIEWER | All known devices with current mode + latest telemetry |
+| GET | `/api/devices` | VIEWER | All known devices with current mode + latest telemetry + registry metadata |
+| GET | `/api/devices/registry?includeRemoved=true` | VIEWER | Full registry, including devices pre-provisioned but never yet connected |
+| POST | `/api/devices` | ADMIN | Register/pre-provision a device: `{"deviceId","name","location","notes","firmwareVersion"}` |
 | GET | `/api/devices/:deviceId` | VIEWER | Detail for one device (404 if never seen) |
+| PATCH | `/api/devices/:deviceId` | ADMIN | Update device metadata |
+| DELETE | `/api/devices/:deviceId` | ADMIN | Remove (soft-delete) a device |
+| POST | `/api/devices/:deviceId/enable` | ADMIN | Enable a device (also restores a removed one) |
+| POST | `/api/devices/:deviceId/disable` | ADMIN | Disable a device -- blocks commands, not telemetry/alarms |
 | GET | `/api/devices/:deviceId/telemetry?limit=N` | VIEWER | Recent telemetry history, newest first (default 50, max 500) |
 | GET | `/api/commands/pending` | VIEWER | Currently live (non-terminal) commands |
 | GET | `/api/commands/history?limit=N&deviceId=X&status=Y` | VIEWER | Recent command history, including who issued each one (default 50, max 500) |
@@ -336,6 +344,38 @@ Voltage, Frequency, Power, and State-of-Charge, rendered as small SVG line chart
 
 ---
 
+## Device Management (v0.5.0)
+
+Devices are still **auto-discovered via telemetry** exactly as before -- nothing about that changes. What's new is an explicit registry layered on top: metadata (name, location, firmware version, notes), a lifecycle (`ENABLED`/`DISABLED`/`REMOVED`), and the ability to pre-provision a device before it's ever connected.
+
+**Performance note, since this sits on the ingestion hot path:** the registry keeps an in-memory `Map` as the read source of truth (write-through to disk), so every telemetry point's registry check is a synchronous lookup, not a disk read -- consistent with the "thousands of points per second without crashing the event loop" goal from day one.
+
+- **Add / pre-provision**: `POST /api/devices` registers a device before it's ever sent telemetry -- useful for planning a fleet before hardware is deployed.
+- **Enable / Disable**: a disabled device is blocked from receiving *commands* -- both operator-issued and auto-generated ones (e.g. the state machine's auto-curtailment), since both flow through the same `CommandDispatcher`. Telemetry keeps recording and alarms are **not** suppressed -- a disabled-but-still-connected device going out of range arguably deserves more attention, not less, so that's deliberately left alone rather than silently hidden.
+- **Remove**: a *soft*-delete (status `REMOVED`), not a file deletion -- hard-deleting the record would make a removed device indistinguishable from one simply never seen before, and its very next telemetry point would silently re-register it. `REMOVED` devices' future telemetry is dropped; the record (and its history) stays visible via `?includeRemoved=true` for audit purposes, and `POST .../enable` brings it back.
+- **Metadata editing & firmware tracking**: `PATCH /api/devices/:deviceId` for name/location/notes/firmware version. Firmware version is operator-entered, not auto-discovered -- none of the current adapters (simulated or real MQTT) transmit one, so this isn't a claim of automatic detection.
+
+New endpoints (all ADMIN except the registry read, which is VIEWER+):
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/devices/registry?includeRemoved=true` | Full registry, including pre-provisioned devices that haven't connected yet |
+| POST | `/api/devices` | Register: `{"deviceId","name","location","notes","firmwareVersion"}` |
+| PATCH | `/api/devices/:deviceId` | Update metadata |
+| POST | `/api/devices/:deviceId/enable` | Enable (also restores a removed device) |
+| POST | `/api/devices/:deviceId/disable` | Disable -- blocks commands, not telemetry/alarms |
+| DELETE | `/api/devices/:deviceId` | Remove (soft-delete) |
+
+The dashboard's "Device Registry" panel (ADMIN-only for actions, visible to everyone) lists every registered device with inline Enable/Disable/Remove/Edit buttons and a registration form.
+
+### Bugs found and fixed while building this
+
+**Retry backoff was never actually backing off.** Testing the disable/re-enable flow surfaced a real, pre-existing bug in the command retry mechanism (not new to this feature -- it's been there since the retry logic was first written): a retrying command was pushed back onto the dispatch queue **immediately** inside `markFailedAttempt`, before its exponential backoff delay had actually elapsed. Since the dispatcher's processing loop was usually still active at that point, it would pick the command straight back up in the same tight loop -- completely bypassing the intended backoff and exhausting the entire retry budget in milliseconds instead of over the intended seconds. It never surfaced before because no existing test depended on backoff *timing* being real, only on the eventual outcome. Fixed by making re-queueing wait for the backoff timer to actually fire (`CommandQueue.requeueForRetry`), and verified with a direct timing measurement: attempts now land at ~2ms/104ms/305ms/707ms/1108ms against an expected ~0/100/300/700/1100ms schedule.
+
+**Shutdown could lose a pending write.** `DeviceRegistry` and `UserStore` each keep their own independent write-serialization chain (writing to `devices.json`/`users.json`), separate from `FileWalStorage`'s. Neither had a way to be flushed, and `orchestrator.stop()` never waited for them -- so a disable/enable/register/user-creation call issued right before shutdown could still be mid-write when the process exited, silently losing that change. This is a real production concern, not just a test artifact (it surfaced as an intermittent `ENOTEMPTY` during test cleanup, which is what led to finding it). Fixed by adding `close()` to both, awaited alongside `storage.close()` in `orchestrator.stop()`.
+
+---
+
 ## Project Structure
 
 <details>
@@ -383,13 +423,15 @@ gridsync-os/
 │   │   ├── PasswordHasher.js          # scrypt-based hashing (Node's built-in crypto)
 │   │   ├── Jwt.js                     # minimal HS256 sign/verify (Node's built-in crypto)
 │   │   └── UserStore.js               # JSON-file backed accounts, 3 roles (ADMIN/OPERATOR/VIEWER)
+│   ├── devices/
+│   │   └── DeviceRegistry.js          # metadata/lifecycle overlay, in-memory-cache (hot-path safe)
 │   └── orchestrator/
 │       └── GridSyncOrchestrator.js    # composition root -- wires everything together
 ├── scripts/
 │   ├── setup-termux.sh                # one-shot Termux environment bootstrap
 │   └── create-user.js                 # CLI account bootstrap/recovery (bypasses the API)
 └── test/
-    └── selftest.js             # 79 tests: unit + simulated end-to-end scenarios
+    └── selftest.js             # 93 tests: unit + simulated end-to-end scenarios
 ```
 
 </details>
@@ -403,7 +445,7 @@ pkg update && pkg install nodejs git -y
 git clone <your-repo-url> gridsync-os   # or unzip the delivered archive
 cd gridsync-os
 npm install          # pure-JS deps only, no compilation step
-npm test             # run the full self-test suite (79 tests)
+npm test             # run the full self-test suite (93 tests)
 npm start             # boot the orchestrator (MQTT + simulated Modbus/DNP3)
 ```
 
@@ -478,7 +520,7 @@ Grid safety limits (voltage/frequency/SoC bounds, max curtail/charge/discharge k
 npm test
 ```
 
-79 tests covering:
+93 tests covering:
 
 - ✅ Pure-function correctness of the state machine (deterministic transitions, auto-curtailment on overvoltage, release on recovery)
 - ✅ Constraint validation (clamping over-limit commands, rejecting unsafe discharge/charge based on SoC, fail-closed on unknown state)
@@ -488,6 +530,10 @@ npm test
 - ✅ Backpressure/overflow bounds (bounded memory under sustained overflow)
 - ✅ Malformed-input resilience (bad payloads are discarded without disrupting subsequent valid points)
 - ✅ A 5,000-point high-velocity burst processed without throwing or hanging
+- ✅ Device registry: idempotent auto-registration, duplicate-registration rejection, soft-delete semantics (removed devices blocked, excluded by default, restorable), persistence across a simulated restart, and the in-memory-cache read path staying correct under all of the above
+- ✅ Device lifecycle enforcement end-to-end: a DISABLED device blocks both manual *and* auto-generated (state-machine) commands, a REMOVED device's telemetry is dropped without being processed, `/api/devices/registry` isn't shadowed by the `/:deviceId` route, and full ADMIN-gated CRUD (register/update/enable/disable/remove) with 404s for unknown devices
+- ✅ **Retry backoff timing**, verified with actual elapsed-time measurements (not just eventual outcome) — a real, previously-undetected bug where retries bypassed their exponential backoff entirely is fixed and regression-tested
+- ✅ **Clean shutdown durability** — `DeviceRegistry` and `UserStore` writes are now flushed before `orchestrator.stop()` resolves; found via an intermittent test-cleanup race that traced back to a real gap where a pending disable/enable/register write could be lost on shutdown
 - ✅ MQTT reconnect-failure log throttling (1st failure logs full detail, every 10th logs a concise summary, counter resets on reconnect) and safe give-up after `GS_MQTT_MAX_RECONNECT_ATTEMPTS` (including a regression test for a double-`.end()` bug found and fixed during review)
 - ✅ REST API routing (`Router` param extraction/matching) and full end-to-end HTTP tests against a real server on an OS-assigned port: every `/api/*` endpoint requires authentication (401 unauthenticated), malformed-JSON (400) and oversized-body (413) handling
 - ✅ Password hashing and JWT sign/verify correctness (roundtrip, tampered signature/payload rejected, expired token rejected, malformed token rejected) and the user store (duplicate usernames rejected, disabled accounts blocked, password hashes never exposed via the API)
@@ -501,12 +547,12 @@ npm test
 **Built:**
 - **Authentication & RBAC**: JWT sessions, scrypt-hashed accounts, 3 roles, audit trail on commands via `issuedBy`, legacy-token backward compatibility.
 - **v0.4.0 Operations Console**: Command Center (dashboard form + confirmation dialog + RBAC-aware visibility, `RESET` command type), Alarm Engine (6 types, persisted trigger/clear/acknowledge lifecycle), Command/Alarm History filtering (`deviceId`/`status` query params), Live Telemetry Charts (hand-rolled SVG, no charting library).
+- **v0.5.0 Device Management**: explicit registry (add/pre-provision, enable/disable, soft-delete/remove, metadata + firmware tracking) layered on top of telemetry-driven discovery, ADMIN-gated CRUD, hot-path-safe in-memory-cache design.
 
 **Not yet built** (tracked, not silently dropped):
 - Live command status transitions *inside the dashboard UI* (Pending→Dispatching→ACK/Failed) -- the API and data already support this (`/api/commands/pending`, `/api/commands/history`), the dashboard shows the current state on each poll but doesn't animate the transition in place
 - Historical database with true time-range queries (last hour/day/week/month) -- current storage supports "most recent N," not date-range queries; this is what a `TimescaleStorage.js` backend (see [Going to Production](#going-to-production)) would properly solve
 - Structured event log (logins, commands, warnings, alarms, recoveries) as a *unified* queryable audit surface -- the individual pieces exist (command history has `issuedBy`; alarm history exists; auth failures are logged) but there's no single combined log endpoint yet
-- Device management (add/remove/enable/disable/metadata/firmware tracking) -- devices are currently discovered implicitly via telemetry, not explicitly managed
 - Full dashboard summary cards (Total Generation, Total Load, Fleet Health, Average Voltage) -- active-alarm and pending-command counts already appear in the status strip, but not as the complete 6-card set originally scoped
 - WebSocket/SSE streaming to replace dashboard polling
 - Docker, CI/CD pipeline, `/metrics` endpoint

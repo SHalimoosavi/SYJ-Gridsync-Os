@@ -11,6 +11,7 @@ const { FileWalStorage } = require('../storage/FileWalStorage');
 const { SqliteStorage } = require('../storage/SqliteStorage');
 const { ApiServer } = require('../api/ApiServer');
 const { UserStore } = require('../auth/UserStore');
+const { DeviceRegistry } = require('../devices/DeviceRegistry');
 const { assertPlainObject, assertNonEmptyString } = require('../utils/validation');
 
 /**
@@ -28,6 +29,8 @@ class GridSyncOrchestrator {
 
     this.storage = this._buildStorage();
     this.userStore = new UserStore({ dataDir: config.storage.dataDir, logger: this.logger });
+    this.deviceRegistry = new DeviceRegistry({ dataDir: config.storage.dataDir, logger: this.logger });
+    this._blockedTelemetryCount = 0;
     this.circuitBreaker = new CircuitBreaker({ ...config.circuitBreaker, logger: this.logger });
     this.alarmEngine = new AlarmEngine({
       gridConstraints: config.gridConstraints,
@@ -69,6 +72,7 @@ class GridSyncOrchestrator {
       queue: this.commandQueue,
       circuitBreaker: this.circuitBreaker,
       constraintValidator: this.constraintValidator,
+      deviceRegistry: this.deviceRegistry,
       resolveAdapter: (deviceId) => this._resolveAdapterForDevice(deviceId),
       getLatestState: (deviceId) => this._latestPoints.get(deviceId) || null,
       config,
@@ -109,6 +113,25 @@ class GridSyncOrchestrator {
   }
 
   async _handlePoint(point, adapterId) {
+    if (this.deviceRegistry.isBlocked(point.deviceId)) {
+      this._blockedTelemetryCount += 1;
+      this.logger.debug('dropping telemetry from a removed device', { deviceId: point.deviceId });
+      return;
+    }
+    // Fire-and-forget: registration is metadata bookkeeping, not a
+    // prerequisite for processing this point. Awaiting it here would add a
+    // one-time delay on a device's first-ever point (its registry write)
+    // relative to that same device's subsequent points -- since
+    // _handlePoint calls for a batch run concurrently (fire-and-forget from
+    // IngestionManager), that delay could let later points "overtake" the
+    // first one, corrupting the temporal order the state machine and
+    // telemetry history both depend on. Found via a real test failure, not
+    // by inspection -- see queryTelemetry's explicit timestamp sort below
+    // for the second, independent layer of defense against this class of bug.
+    this.deviceRegistry.ensureRegistered(point.deviceId, { name: point.deviceId }).catch((err) => {
+      this.logger.error('failed to auto-register device (continuing)', { deviceId: point.deviceId, err });
+    });
+
     this._deviceAdapterRouting.set(point.deviceId, adapterId);
     this.circuitBreaker.recordTelemetry(point.deviceId, point.timestamp);
     this._latestPoints.set(point.deviceId, point);
@@ -177,15 +200,20 @@ class GridSyncOrchestrator {
     }
   }
 
-  /** All known devices with their current FSM mode and latest telemetry -- used by the API/dashboard. */
+  /** All known devices with their current FSM mode, latest telemetry, and registry metadata -- used by the API/dashboard. */
   listDevices() {
     const devices = [];
     for (const [deviceId, state] of this._deviceStates) {
+      const registryRecord = this.deviceRegistry.get(deviceId);
       devices.push({
         deviceId,
         mode: state.mode,
         consecutiveViolations: state.consecutiveViolations,
         lastPoint: this._latestPoints.get(deviceId) || null,
+        name: registryRecord?.name || deviceId,
+        location: registryRecord?.location || null,
+        firmwareVersion: registryRecord?.firmwareVersion || null,
+        status: registryRecord?.status || 'ENABLED',
       });
     }
     return devices;
@@ -195,6 +223,7 @@ class GridSyncOrchestrator {
   getDeviceDetail(deviceId) {
     const state = this._deviceStates.get(deviceId);
     if (!state) return null;
+    const registryRecord = this.deviceRegistry.get(deviceId);
     return {
       deviceId,
       mode: state.mode,
@@ -202,7 +231,38 @@ class GridSyncOrchestrator {
       violations: state.violations,
       lastPoint: this._latestPoints.get(deviceId) || null,
       adapterId: this._deviceAdapterRouting.get(deviceId) || null,
+      name: registryRecord?.name || deviceId,
+      location: registryRecord?.location || null,
+      notes: registryRecord?.notes || null,
+      firmwareVersion: registryRecord?.firmwareVersion || null,
+      status: registryRecord?.status || 'ENABLED',
     };
+  }
+
+  /** Raw registry view (includes devices pre-provisioned but never yet connected) -- distinct from listDevices(), which is telemetry-derived. */
+  listRegisteredDevices({ includeRemoved = false } = {}) {
+    return this.deviceRegistry.list({ includeRemoved });
+  }
+
+  async registerDevice({ deviceId, name, location, notes, firmwareVersion }) {
+    return this.deviceRegistry.register({ deviceId, name, location, notes, firmwareVersion });
+  }
+
+  async updateDeviceMetadata(deviceId, patch) {
+    return this.deviceRegistry.update(deviceId, patch);
+  }
+
+  async setDeviceStatus(deviceId, status) {
+    return this.deviceRegistry.setStatus(deviceId, status);
+  }
+
+  /** Removes a device from active tracking (soft-delete in the registry; future telemetry from it is dropped). */
+  async removeDevice(deviceId) {
+    const record = await this.deviceRegistry.setStatus(deviceId, 'REMOVED');
+    this._deviceStates.delete(deviceId);
+    this._latestPoints.delete(deviceId);
+    this._deviceAdapterRouting.delete(deviceId);
+    return record;
   }
 
   async _bootstrapAdminIfConfigured() {
@@ -222,6 +282,7 @@ class GridSyncOrchestrator {
     if (this._started) return;
     await this.storage.init();
     await this.userStore.init();
+    await this.deviceRegistry.init();
     await this._bootstrapAdminIfConfigured();
     const recoveredCount = await this.commandQueue.recover();
     this.commandDispatcher.start();
@@ -277,6 +338,8 @@ class GridSyncOrchestrator {
       });
     }
     await this.storage.close();
+    await this.deviceRegistry.close();
+    await this.userStore.close();
     this._started = false;
     this.logger.info('GridSync-OS orchestrator stopped');
   }
@@ -287,6 +350,8 @@ class GridSyncOrchestrator {
       circuitBreaker: this.circuitBreaker.getStatus(),
       pendingCommands: this.commandQueue.size(),
       activeAlarms: this.alarmEngine.listActive().length,
+      registeredDevices: this.deviceRegistry.list().length,
+      blockedTelemetry: this._blockedTelemetryCount,
       devices: [...this._deviceStates.values()].map((s) => ({
         deviceId: s.deviceId,
         mode: s.mode,

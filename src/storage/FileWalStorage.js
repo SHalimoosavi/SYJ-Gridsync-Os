@@ -140,7 +140,12 @@ class FileWalStorage extends StorageAdapter {
         if (this.logger) this.logger.warn('skipping corrupt telemetry line during query');
       }
     }
-    // File is append-only chronological -- the tail is the most recent.
+    // Sort by timestamp explicitly rather than trusting file-append order
+    // to equal chronological order -- concurrent writes for the same
+    // device are not guaranteed to land in temporal order (see the
+    // orchestrator's _handlePoint docblock for a real case that violated
+    // this assumption).
+    matches.sort((a, b) => a.timestamp - b.timestamp);
     return matches.slice(-limit).reverse();
   }
 

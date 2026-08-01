@@ -125,6 +125,43 @@ class ApiServer {
       this._json(res, 200, { devices: this.orchestrator.listDevices() });
     }));
 
+    // Registered BEFORE the /:deviceId param route below -- otherwise
+    // "registry" would be captured as a literal deviceId, since the
+    // router matches routes in registration order and :deviceId matches
+    // any single path segment.
+    r.get('/api/devices/registry', this._guard('VIEWER', (req, res, params, query) => {
+      const includeRemoved = query.get('includeRemoved') === 'true';
+      this._json(res, 200, { devices: this.orchestrator.listRegisteredDevices({ includeRemoved }) });
+    }));
+
+    r.post('/api/devices', this._guard('ADMIN', async (req, res) => {
+      let body;
+      try {
+        body = await this._readJsonBody(req);
+      } catch (err) {
+        this._json(res, err.statusCode || 400, { error: err.message });
+        return;
+      }
+      try {
+        assertNonEmptyString(body.deviceId, 'deviceId');
+        const record = await this.orchestrator.registerDevice({
+          deviceId: body.deviceId,
+          name: body.name,
+          location: body.location,
+          notes: body.notes,
+          firmwareVersion: body.firmwareVersion,
+        });
+        this._json(res, 201, { device: record });
+      } catch (err) {
+        if (err instanceof ValidationError) {
+          this._json(res, 400, { error: err.message });
+        } else {
+          this.logger.error('device registration failed', { err });
+          this._json(res, 500, { error: 'Failed to register device' });
+        }
+      }
+    }));
+
     r.get('/api/devices/:deviceId', this._guard('VIEWER', (req, res, params) => {
       const detail = this.orchestrator.getDeviceDetail(params.deviceId);
       if (!detail) {
@@ -132,6 +169,69 @@ class ApiServer {
         return;
       }
       this._json(res, 200, detail);
+    }));
+
+    r.patch('/api/devices/:deviceId', this._guard('ADMIN', async (req, res, params) => {
+      let body;
+      try {
+        body = await this._readJsonBody(req);
+      } catch (err) {
+        this._json(res, err.statusCode || 400, { error: err.message });
+        return;
+      }
+      try {
+        const record = await this.orchestrator.updateDeviceMetadata(params.deviceId, body);
+        this._json(res, 200, { device: record });
+      } catch (err) {
+        if (err instanceof ValidationError) {
+          this._json(res, 404, { error: err.message });
+        } else {
+          this.logger.error('device metadata update failed', { deviceId: params.deviceId, err });
+          this._json(res, 500, { error: 'Failed to update device' });
+        }
+      }
+    }));
+
+    r.delete('/api/devices/:deviceId', this._guard('ADMIN', async (req, res, params) => {
+      try {
+        const record = await this.orchestrator.removeDevice(params.deviceId);
+        this._json(res, 200, { device: record });
+      } catch (err) {
+        if (err instanceof ValidationError) {
+          this._json(res, 404, { error: err.message });
+        } else {
+          this.logger.error('device removal failed', { deviceId: params.deviceId, err });
+          this._json(res, 500, { error: 'Failed to remove device' });
+        }
+      }
+    }));
+
+    r.post('/api/devices/:deviceId/enable', this._guard('ADMIN', async (req, res, params) => {
+      try {
+        const record = await this.orchestrator.setDeviceStatus(params.deviceId, 'ENABLED');
+        this._json(res, 200, { device: record });
+      } catch (err) {
+        if (err instanceof ValidationError) {
+          this._json(res, 404, { error: err.message });
+        } else {
+          this.logger.error('device enable failed', { deviceId: params.deviceId, err });
+          this._json(res, 500, { error: 'Failed to enable device' });
+        }
+      }
+    }));
+
+    r.post('/api/devices/:deviceId/disable', this._guard('ADMIN', async (req, res, params) => {
+      try {
+        const record = await this.orchestrator.setDeviceStatus(params.deviceId, 'DISABLED');
+        this._json(res, 200, { device: record });
+      } catch (err) {
+        if (err instanceof ValidationError) {
+          this._json(res, 404, { error: err.message });
+        } else {
+          this.logger.error('device disable failed', { deviceId: params.deviceId, err });
+          this._json(res, 500, { error: 'Failed to disable device' });
+        }
+      }
     }));
 
     r.get('/api/devices/:deviceId/telemetry', this._guard('VIEWER', async (req, res, params, query) => {
