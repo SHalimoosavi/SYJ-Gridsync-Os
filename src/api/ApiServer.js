@@ -9,6 +9,7 @@ const Jwt = require('../auth/Jwt');
 const { ROLE_RANK, ROLES } = require('../auth/UserStore');
 const { ValidationError } = require('../utils/errors');
 const { assertNonEmptyString, assertOneOf } = require('../utils/validation');
+const { resolveTimeFilter } = require('../utils/timeRange');
 
 const DASHBOARD_HTML_PATH = path.join(__dirname, 'dashboard.html');
 const DEFAULT_LIMIT = 50;
@@ -236,9 +237,10 @@ class ApiServer {
 
     r.get('/api/devices/:deviceId/telemetry', this._guard('VIEWER', async (req, res, params, query) => {
       const limit = clampLimit(query.get('limit'));
+      const timeFilter = resolveTimeFilter(query);
       try {
-        const points = await this.orchestrator.storage.queryTelemetry(params.deviceId, limit);
-        this._json(res, 200, { deviceId: params.deviceId, count: points.length, points });
+        const points = await this.orchestrator.storage.queryTelemetry(params.deviceId, limit, timeFilter);
+        this._json(res, 200, { deviceId: params.deviceId, count: points.length, range: timeFilter, points });
       } catch (err) {
         this.logger.error('telemetry query failed', { deviceId: params.deviceId, err });
         this._json(res, 500, { error: 'Failed to query telemetry' });
@@ -251,12 +253,12 @@ class ApiServer {
 
     r.get('/api/commands/history', this._guard('VIEWER', async (req, res, params, query) => {
       const limit = clampLimit(query.get('limit'));
-      const filters = {};
+      const filters = resolveTimeFilter(query);
       if (query.get('deviceId')) filters.deviceId = query.get('deviceId');
       if (query.get('status')) filters.status = query.get('status');
       try {
         const commands = await this.orchestrator.storage.queryCommandHistory(limit, filters);
-        this._json(res, 200, { count: commands.length, commands });
+        this._json(res, 200, { count: commands.length, range: { startTime: filters.startTime, endTime: filters.endTime }, commands });
       } catch (err) {
         this.logger.error('command history query failed', { err });
         this._json(res, 500, { error: 'Failed to query command history' });
@@ -269,12 +271,12 @@ class ApiServer {
 
     r.get('/api/alarms/history', this._guard('VIEWER', async (req, res, params, query) => {
       const limit = clampLimit(query.get('limit'));
-      const filters = {};
+      const filters = resolveTimeFilter(query);
       if (query.get('deviceId')) filters.deviceId = query.get('deviceId');
       if (query.get('status')) filters.status = query.get('status');
       try {
         const alarms = await this.orchestrator.storage.queryAlarmHistory(limit, filters);
-        this._json(res, 200, { count: alarms.length, alarms });
+        this._json(res, 200, { count: alarms.length, range: { startTime: filters.startTime, endTime: filters.endTime }, alarms });
       } catch (err) {
         this.logger.error('alarm history query failed', { err });
         this._json(res, 500, { error: 'Failed to query alarm history' });

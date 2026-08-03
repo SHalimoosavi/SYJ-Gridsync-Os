@@ -11,15 +11,16 @@
 <br/>
 
 ![Node.js](https://img.shields.io/badge/Node.js-%E2%89%A518-green?logo=node.js&logoColor=white)
-![Version](https://img.shields.io/badge/Version-v0.5.0-blueviolet)
+![Version](https://img.shields.io/badge/Version-v0.6.0-blueviolet)
 ![License](https://img.shields.io/badge/License-Proprietary-blue)
-![Tests](https://img.shields.io/badge/Self--Tests-93%20Passing-success?logo=checkmarx&logoColor=white)
+![Tests](https://img.shields.io/badge/Self--Tests-101%20Passing-success?logo=checkmarx&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Termux%20%7C%20Linux%20%7C%20Windows-orange)
 ![MQTT](https://img.shields.io/badge/MQTT-Supported-660066?logo=mqtt&logoColor=white)
 ![API](https://img.shields.io/badge/REST%20API-Dashboard%20%2B%20Endpoints-informational)
 ![Auth](https://img.shields.io/badge/Auth-JWT%20%2B%20RBAC-critical)
 ![Alarms](https://img.shields.io/badge/Alarm%20Engine-6%20Types-yellow)
 ![Devices](https://img.shields.io/badge/Device%20Management-Registry%20%2B%20RBAC-lightgrey)
+![History](https://img.shields.io/badge/Reporting-Hour%2FDay%2FWeek%2FMonth-9cf)
 ![Industrial](https://img.shields.io/badge/Industrial-IIoT-red)
 ![Dependencies](https://img.shields.io/badge/Native%20Deps-Zero-blueviolet)
 
@@ -41,6 +42,7 @@
 - [Authentication & RBAC](#authentication--rbac)
 - [Operations Console (v0.4.0)](#operations-console-v040)
 - [Device Management (v0.5.0)](#device-management-v050)
+- [Historical Reporting & Time-Range Queries (v0.6.0)](#historical-reporting--time-range-queries-v060)
 - [Project Structure](#project-structure)
 - [Getting Started (Termux)](#getting-started-termux)
 - [Initializing Your Own Git Repository](#initializing-your-own-git-repository)
@@ -212,12 +214,12 @@ Open that URL in a browser for a live view of device fleet status (voltage/frequ
 | DELETE | `/api/devices/:deviceId` | ADMIN | Remove (soft-delete) a device |
 | POST | `/api/devices/:deviceId/enable` | ADMIN | Enable a device (also restores a removed one) |
 | POST | `/api/devices/:deviceId/disable` | ADMIN | Disable a device -- blocks commands, not telemetry/alarms |
-| GET | `/api/devices/:deviceId/telemetry?limit=N` | VIEWER | Recent telemetry history, newest first (default 50, max 500) |
+| GET | `/api/devices/:deviceId/telemetry?limit=N&range=X` | VIEWER | Recent telemetry history, newest first (default 50, max 500); `range` = `hour`\\|`day`\\|`week`\\|`month`, or explicit `startTime`/`endTime` (ms epoch) |
 | GET | `/api/commands/pending` | VIEWER | Currently live (non-terminal) commands |
-| GET | `/api/commands/history?limit=N&deviceId=X&status=Y` | VIEWER | Recent command history, including who issued each one (default 50, max 500) |
+| GET | `/api/commands/history?limit=N&deviceId=X&status=Y&range=Z` | VIEWER | Recent command history, including who issued each one (default 50, max 500); same `range`/`startTime`/`endTime` support as telemetry |
 | POST | `/api/commands` | OPERATOR | Issue a manual command: `{"type","deviceId","value","reason"}` (types: `CURTAIL`,`DISCHARGE`,`CHARGE`,`STANDBY`,`RESET`) |
 | GET | `/api/alarms/active` | VIEWER | Currently active (unresolved) alarms fleet-wide |
-| GET | `/api/alarms/history?limit=N&deviceId=X&status=Y` | VIEWER | Recent alarm history (triggered/cleared/acknowledged) |
+| GET | `/api/alarms/history?limit=N&deviceId=X&status=Y&range=Z` | VIEWER | Recent alarm history (triggered/cleared/acknowledged); same `range`/`startTime`/`endTime` support |
 | POST | `/api/alarms/:alarmId/acknowledge` | OPERATOR | Acknowledge one active alarm |
 | GET | `/api/auth/users` | ADMIN | List accounts (sanitized -- no password hashes) |
 | POST | `/api/auth/users` | ADMIN | Create an account: `{"username","password","role"}` |
@@ -376,6 +378,33 @@ The dashboard's "Device Registry" panel (ADMIN-only for actions, visible to ever
 
 ---
 
+## Historical Reporting & Time-Range Queries (v0.6.0)
+
+**Scoping note, stated up front:** this is real `startTime`/`endTime` filtering with `hour`/`day`/`week`/`month` presets added to the *existing* storage backends -- not a new database technology. This project has stayed zero-external-dependency (no Postgres, no native builds, Termux-first) through every phase so far, and adding a hard requirement on an external database server for one reporting feature would break that. If you need serious historical scale (years of high-frequency data, calendar-aware rollups, fast aggregation), that's genuinely what a proper time-series database solves -- the `TimescaleStorage.js` extension point mentioned in [Going to Production](#going-to-production) is exactly where that would go, and it's still not built.
+
+### What's actually here
+
+Every history-capable endpoint now accepts:
+
+- `?range=hour` / `day` / `week` / `month` -- a rolling window ending now (`month` is a fixed 30-day window, not calendar-aware)
+- `?startTime=<ms>&endTime=<ms>` -- explicit epoch-millisecond bounds, either or both; these override the equivalent field from `range` if both are given, so `?range=day&endTime=1700000000000` ("a day ending at a specific point") works too
+- The resolved `{startTime, endTime}` is echoed back in the response body, so a client always knows exactly what window it got without recomputing it
+
+```
+GET /api/devices/:deviceId/telemetry?range=week
+GET /api/commands/history?range=day&deviceId=inverter-01
+GET /api/alarms/history?startTime=1700000000000&endTime=1700086400000
+```
+
+The dashboard's "Live Telemetry & Device Control" panel has a Time Range selector next to the device selector, driving both the charts and the Recent Commands table together. Chart point density scales with the selected window (30 points for "hour," up to the API's 500-point cap for "week"/"month") so a wide window isn't under-sampled into a nearly-flat line.
+
+### The honest performance tradeoff between backends
+
+- **`SqliteStorage`**: `startTime`/`endTime` become indexed `WHERE ts BETWEEN ? AND ?` clauses -- efficient regardless of how much history has accumulated.
+- **`FileWalStorage`** (the default): still a linear scan over the relevant `.jsonl` file, now with an additional filter predicate. Correct, and fine for a Termux-scale deployment, but a `?range=month` query on a fleet that's been running for months does mean reading that whole file. If query latency at that scale matters for your deployment, that's the concrete signal to switch to `GS_STORAGE_DRIVER=sqlite`.
+
+---
+
 ## Project Structure
 
 <details>
@@ -394,7 +423,8 @@ gridsync-os/
 │   │   ├── errors.js                  # typed domain errors
 │   │   ├── logger.js                  # dependency-free structured logger
 │   │   ├── validation.js              # defensive input-assertion helpers
-│   │   └── RingBuffer.js              # fixed-capacity O(1) circular buffer
+│   │   ├── RingBuffer.js              # fixed-capacity O(1) circular buffer
+│   │   └── timeRange.js               # hour/day/week/month presets + explicit startTime/endTime resolution
 │   ├── adapters/
 │   │   ├── AdapterBase.js             # common adapter contract (EventEmitter-based)
 │   │   ├── MqttAdapter.js             # real MQTT broker transport (mqtt.js, pure JS)
@@ -431,7 +461,7 @@ gridsync-os/
 │   ├── setup-termux.sh                # one-shot Termux environment bootstrap
 │   └── create-user.js                 # CLI account bootstrap/recovery (bypasses the API)
 └── test/
-    └── selftest.js             # 93 tests: unit + simulated end-to-end scenarios
+    └── selftest.js             # 101 tests: unit + simulated end-to-end scenarios
 ```
 
 </details>
@@ -445,7 +475,7 @@ pkg update && pkg install nodejs git -y
 git clone <your-repo-url> gridsync-os   # or unzip the delivered archive
 cd gridsync-os
 npm install          # pure-JS deps only, no compilation step
-npm test             # run the full self-test suite (93 tests)
+npm test             # run the full self-test suite (101 tests)
 npm start             # boot the orchestrator (MQTT + simulated Modbus/DNP3)
 ```
 
@@ -520,7 +550,7 @@ Grid safety limits (voltage/frequency/SoC bounds, max curtail/charge/discharge k
 npm test
 ```
 
-93 tests covering:
+101 tests covering:
 
 - ✅ Pure-function correctness of the state machine (deterministic transitions, auto-curtailment on overvoltage, release on recovery)
 - ✅ Constraint validation (clamping over-limit commands, rejecting unsafe discharge/charge based on SoC, fail-closed on unknown state)
@@ -534,6 +564,7 @@ npm test
 - ✅ Device lifecycle enforcement end-to-end: a DISABLED device blocks both manual *and* auto-generated (state-machine) commands, a REMOVED device's telemetry is dropped without being processed, `/api/devices/registry` isn't shadowed by the `/:deviceId` route, and full ADMIN-gated CRUD (register/update/enable/disable/remove) with 404s for unknown devices
 - ✅ **Retry backoff timing**, verified with actual elapsed-time measurements (not just eventual outcome) — a real, previously-undetected bug where retries bypassed their exponential backoff entirely is fixed and regression-tested
 - ✅ **Clean shutdown durability** — `DeviceRegistry` and `UserStore` writes are now flushed before `orchestrator.stop()` resolves; found via an intermittent test-cleanup race that traced back to a real gap where a pending disable/enable/register write could be lost on shutdown
+- ✅ Time-range queries: all four named presets resolve to the correct window, explicit `startTime`/`endTime` correctly override a named range per-field, invalid/unrecognized values are ignored rather than erroring, and both storage backends (`FileWalStorage` linear-scan, `SqliteStorage` indexed `WHERE`) return identical, correctly-bounded results combined with existing `deviceId`/`status` filters
 - ✅ MQTT reconnect-failure log throttling (1st failure logs full detail, every 10th logs a concise summary, counter resets on reconnect) and safe give-up after `GS_MQTT_MAX_RECONNECT_ATTEMPTS` (including a regression test for a double-`.end()` bug found and fixed during review)
 - ✅ REST API routing (`Router` param extraction/matching) and full end-to-end HTTP tests against a real server on an OS-assigned port: every `/api/*` endpoint requires authentication (401 unauthenticated), malformed-JSON (400) and oversized-body (413) handling
 - ✅ Password hashing and JWT sign/verify correctness (roundtrip, tampered signature/payload rejected, expired token rejected, malformed token rejected) and the user store (duplicate usernames rejected, disabled accounts blocked, password hashes never exposed via the API)
@@ -548,10 +579,11 @@ npm test
 - **Authentication & RBAC**: JWT sessions, scrypt-hashed accounts, 3 roles, audit trail on commands via `issuedBy`, legacy-token backward compatibility.
 - **v0.4.0 Operations Console**: Command Center (dashboard form + confirmation dialog + RBAC-aware visibility, `RESET` command type), Alarm Engine (6 types, persisted trigger/clear/acknowledge lifecycle), Command/Alarm History filtering (`deviceId`/`status` query params), Live Telemetry Charts (hand-rolled SVG, no charting library).
 - **v0.5.0 Device Management**: explicit registry (add/pre-provision, enable/disable, soft-delete/remove, metadata + firmware tracking) layered on top of telemetry-driven discovery, ADMIN-gated CRUD, hot-path-safe in-memory-cache design.
+- **v0.6.0 Historical Reporting**: `hour`/`day`/`week`/`month` presets plus explicit `startTime`/`endTime` on all three history endpoints (telemetry, commands, alarms), both storage backends.
 
 **Not yet built** (tracked, not silently dropped):
 - Live command status transitions *inside the dashboard UI* (Pending→Dispatching→ACK/Failed) -- the API and data already support this (`/api/commands/pending`, `/api/commands/history`), the dashboard shows the current state on each poll but doesn't animate the transition in place
-- Historical database with true time-range queries (last hour/day/week/month) -- current storage supports "most recent N," not date-range queries; this is what a `TimescaleStorage.js` backend (see [Going to Production](#going-to-production)) would properly solve
+- A real time-series database backend (`TimescaleStorage.js`) for serious historical scale -- calendar-aware rollups, fast aggregation (e.g. "average voltage last week"), and years of high-frequency data without a linear file scan. v0.6.0 added the query *capability* (time-range filtering) to the existing zero-dependency backends; this would be the next step up for anyone who outgrows that.
 - Structured event log (logins, commands, warnings, alarms, recoveries) as a *unified* queryable audit surface -- the individual pieces exist (command history has `issuedBy`; alarm history exists; auth failures are logged) but there's no single combined log endpoint yet
 - Full dashboard summary cards (Total Generation, Total Load, Fleet Health, Average Voltage) -- active-alarm and pending-command counts already appear in the status strip, but not as the complete 6-card set originally scoped
 - WebSocket/SSE streaming to replace dashboard polling

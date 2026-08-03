@@ -17,6 +17,7 @@ const { CircuitBreaker } = require('../src/engine/CircuitBreaker');
 const { StateMachine, MODES } = require('../src/engine/StateMachine');
 const { AlarmEngine } = require('../src/engine/AlarmEngine');
 const { DeviceRegistry } = require('../src/devices/DeviceRegistry');
+const { RANGE_PRESETS, resolveRange, resolveTimeFilter } = require('../src/utils/timeRange');
 const { CommandQueue } = require('../src/commands/CommandQueue');
 const { CommandDispatcher } = require('../src/commands/CommandDispatcher');
 const { FileWalStorage } = require('../src/storage/FileWalStorage');
@@ -583,6 +584,49 @@ test('FileWalStorage: queryCommandHistory respects deviceId and status filters',
   }
 });
 
+test('FileWalStorage: time-range filtering (startTime/endTime) works for telemetry, commands, and alarms', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const storage = new FileWalStorage({
+      dataDir,
+      compactionIntervalMs: 999999999,
+      maxWalLinesBeforeCompaction: 999999999,
+      logger: quietLogger,
+    });
+    await storage.init();
+
+    // Telemetry: 5 points at t=1000..5000 for the same device.
+    for (let i = 1; i <= 5; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await storage.appendTelemetry({ deviceId: 'inv-range', deviceType: 'METER', protocol: 'MQTT', timestamp: i * 1000, metrics: { voltage: 220 + i } });
+    }
+    const midRange = await storage.queryTelemetry('inv-range', 50, { startTime: 2000, endTime: 4000 });
+    assert.equal(midRange.length, 3, 'should include t=2000,3000,4000 inclusive');
+    assert.ok(midRange.every((p) => p.timestamp >= 2000 && p.timestamp <= 4000));
+
+    const openEnded = await storage.queryTelemetry('inv-range', 50, { startTime: 4000 });
+    assert.equal(openEnded.length, 2, 'only a lower bound: t=4000,5000');
+
+    // Commands: combine time-range with an existing deviceId filter.
+    await storage.appendCommandEvent({ commandId: 'rc1', deviceId: 'inv-range', event: 'CREATED', status: 'ACKED', ts: 1000 });
+    await storage.appendCommandEvent({ commandId: 'rc2', deviceId: 'inv-range', event: 'CREATED', status: 'ACKED', ts: 9000 });
+    const recentCommands = await storage.queryCommandHistory(50, { deviceId: 'inv-range', startTime: 5000 });
+    assert.equal(recentCommands.length, 1);
+    assert.equal(recentCommands[0].commandId, 'rc2');
+
+    // Alarms: same combination.
+    await storage.appendAlarmEvent({ alarmId: 'ra1', deviceId: 'inv-range', event: 'TRIGGERED', status: 'ACTIVE', type: 'LOW_SOC', ts: 1000 });
+    await storage.appendAlarmEvent({ alarmId: 'ra2', deviceId: 'inv-range', event: 'TRIGGERED', status: 'ACTIVE', type: 'LOW_SOC', ts: 9000 });
+    const recentAlarms = await storage.queryAlarmHistory(50, { startTime: 5000 });
+    assert.equal(recentAlarms.length, 1);
+    assert.equal(recentAlarms[0].alarmId, 'ra2');
+
+    await storage.close();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
 test('SqliteStorage: full interface (telemetry, commands, alarms, filters) -- previously had zero coverage', { skip: !SqliteStorage.isSupported() }, async () => {
   const dataDir = await mkTempDir();
   try {
@@ -594,12 +638,15 @@ test('SqliteStorage: full interface (telemetry, commands, alarms, filters) -- pr
     const telemetry = await storage.queryTelemetry('inv-01', 10);
     assert.equal(telemetry.length, 2);
     assert.equal(telemetry[0].timestamp, 2000, 'newest first');
+    assert.equal((await storage.queryTelemetry('inv-01', 10, { startTime: 1500 })).length, 1, 'time-range lower bound');
+    assert.equal((await storage.queryTelemetry('inv-01', 10, { startTime: 1500, endTime: 1800 })).length, 0, 'empty range yields no rows');
 
     await storage.appendCommandEvent({ commandId: 'c1', deviceId: 'inv-01', event: 'CREATED', status: 'ACKED', attempts: 0, ts: 1000 });
     await storage.appendCommandEvent({ commandId: 'c2', deviceId: 'inv-02', event: 'CREATED', status: 'FAILED', attempts: 1, ts: 2000 });
     assert.equal((await storage.queryCommandHistory(10)).length, 2);
     assert.equal((await storage.queryCommandHistory(10, { deviceId: 'inv-01' })).length, 1);
     assert.equal((await storage.queryCommandHistory(10, { status: 'FAILED' })).length, 1);
+    assert.equal((await storage.queryCommandHistory(10, { startTime: 1500 })).length, 1, 'time-range combined with no other filter');
     assert.equal((await storage.loadPendingCommands()).length, 0, 'both commands are terminal (ACKED/FAILED)');
 
     await storage.appendAlarmEvent({ alarmId: 'a1', deviceId: 'inv-01', event: 'TRIGGERED', status: 'ACTIVE', type: 'OVER_VOLTAGE', ts: 1000 });
@@ -610,6 +657,7 @@ test('SqliteStorage: full interface (telemetry, commands, alarms, filters) -- pr
     assert.equal(alarmHistory.find((a) => a.alarmId === 'a1').status, 'CLEARED');
     assert.equal((await storage.queryAlarmHistory(10, { deviceId: 'inv-02' })).length, 1);
     assert.equal((await storage.queryAlarmHistory(10, { status: 'CLEARED' })).length, 1);
+    assert.equal((await storage.queryAlarmHistory(10, { endTime: 2500 })).length, 1, 'time-range upper bound (a1 last touched at ts=3000, excluded; a2 at ts=2000, included)');
 
     await storage.close();
   } finally {
@@ -1187,6 +1235,50 @@ test('DeviceRegistry: state persists and reloads correctly across a simulated re
   }
 });
 
+// ---------------------------------------------------------------------------
+// timeRange: named range presets + explicit startTime/endTime resolution
+// ---------------------------------------------------------------------------
+
+test('timeRange: resolveRange computes correct windows for each preset', () => {
+  const now = 1_000_000_000;
+  assert.deepEqual(resolveRange('hour', now), { startTime: now - RANGE_PRESETS.hour, endTime: now });
+  assert.deepEqual(resolveRange('day', now), { startTime: now - RANGE_PRESETS.day, endTime: now });
+  assert.deepEqual(resolveRange('week', now), { startTime: now - RANGE_PRESETS.week, endTime: now });
+  assert.deepEqual(resolveRange('month', now), { startTime: now - RANGE_PRESETS.month, endTime: now });
+});
+
+test('timeRange: resolveRange returns null for an unrecognized preset', () => {
+  assert.equal(resolveRange('fortnight', 1000), null);
+  assert.equal(resolveRange('', 1000), null);
+});
+
+test('timeRange: resolveTimeFilter resolves a named range from query params', () => {
+  const now = 1_000_000_000;
+  const query = new URLSearchParams({ range: 'day' });
+  const filter = resolveTimeFilter(query, now);
+  assert.equal(filter.startTime, now - RANGE_PRESETS.day);
+  assert.equal(filter.endTime, now);
+});
+
+test('timeRange: resolveTimeFilter honors explicit startTime/endTime over a named range', () => {
+  const now = 1_000_000_000;
+  const query = new URLSearchParams({ range: 'day', endTime: '500000000' });
+  const filter = resolveTimeFilter(query, now);
+  assert.equal(filter.startTime, now - RANGE_PRESETS.day, 'range still supplies startTime');
+  assert.equal(filter.endTime, 500000000, 'explicit endTime overrides the range-derived one');
+});
+
+test('timeRange: resolveTimeFilter ignores an unrecognized range name and invalid numeric values', () => {
+  const query = new URLSearchParams({ range: 'fortnight', startTime: 'not-a-number' });
+  const filter = resolveTimeFilter(query, 1000);
+  assert.deepEqual(filter, {});
+});
+
+test('timeRange: resolveTimeFilter returns an empty object when no params are present', () => {
+  const query = new URLSearchParams();
+  assert.deepEqual(resolveTimeFilter(query, 1000), {});
+});
+
 test('Router: matches a static route and rejects wrong method', () => {
   const r = new Router();
   r.get('/health', () => 'ok');
@@ -1757,6 +1849,41 @@ test('ApiServer: GET /api/commands/history supports deviceId and status filters'
     const filtered = await (await fetch(`${h.base}/api/commands/history?deviceId=filter-dev-01`, { headers: auth })).json();
     assert.ok(filtered.commands.length >= 1);
     assert.ok(filtered.commands.every((c) => c.deviceId === 'filter-dev-01'));
+
+    await h.orchestrator.stop();
+  } finally {
+    await rmTempDir(dataDir);
+  }
+});
+
+test('ApiServer: telemetry/command-history/alarm-history endpoints accept ?range= presets and explicit startTime/endTime', async () => {
+  const dataDir = await mkTempDir();
+  try {
+    const h = await buildApiHarness(dataDir);
+    const auth = h.authHeader(h.viewerToken);
+
+    h.fakeAdapter.emitTelemetry(
+      { deviceId: 'range-dev-01', deviceType: 'INVERTER', voltage: 230, frequency: 50, soc: 0.5, timestamp: Date.now() },
+      { protocol: 'MQTT', deviceId: 'range-dev-01' },
+    );
+    await waitUntil(() => h.orchestrator.getDeviceDetail('range-dev-01') !== null, 2000);
+
+    // 'hour' preset must include a just-emitted point.
+    const telemetryRes = await fetch(`${h.base}/api/devices/range-dev-01/telemetry?range=hour`, { headers: auth });
+    assert.equal(telemetryRes.status, 200);
+    const telemetryBody = await telemetryRes.json();
+    assert.equal(telemetryBody.count, 1);
+    assert.ok(telemetryBody.range.startTime && telemetryBody.range.endTime, 'resolved range is echoed back in the response');
+
+    // An impossible historical window (explicit startTime/endTime) must exclude it.
+    const excludedRes = await fetch(`${h.base}/api/devices/range-dev-01/telemetry?startTime=0&endTime=1`, { headers: auth });
+    assert.equal((await excludedRes.json()).count, 0);
+
+    // Command/alarm history endpoints accept the same params without erroring, even with nothing to return.
+    const cmdRangeRes = await fetch(`${h.base}/api/commands/history?range=week`, { headers: auth });
+    assert.equal(cmdRangeRes.status, 200);
+    const alarmRangeRes = await fetch(`${h.base}/api/alarms/history?range=month`, { headers: auth });
+    assert.equal(alarmRangeRes.status, 200);
 
     await h.orchestrator.stop();
   } finally {

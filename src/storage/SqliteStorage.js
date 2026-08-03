@@ -163,12 +163,22 @@ class SqliteStorage extends StorageAdapter {
     }
   }
 
-  async queryTelemetry(deviceId, limit) {
+  async queryTelemetry(deviceId, limit, filters = {}) {
     assertNonEmptyString(deviceId, 'deviceId');
     try {
-      const rows = this.db
-        .prepare('SELECT * FROM telemetry WHERE device_id = ? ORDER BY ts DESC LIMIT ?')
-        .all(deviceId, limit);
+      let sql = 'SELECT * FROM telemetry WHERE device_id = ?';
+      const params = [deviceId];
+      if (filters.startTime !== undefined) {
+        sql += ' AND ts >= ?';
+        params.push(filters.startTime);
+      }
+      if (filters.endTime !== undefined) {
+        sql += ' AND ts <= ?';
+        params.push(filters.endTime);
+      }
+      sql += ' ORDER BY ts DESC LIMIT ?';
+      params.push(limit);
+      const rows = this.db.prepare(sql).all(...params);
       return rows.map((r) => ({
         deviceId: r.device_id,
         protocol: r.protocol,
@@ -196,6 +206,14 @@ class SqliteStorage extends StorageAdapter {
         where.push('ce.status = ?');
         params.push(filters.status);
       }
+      if (filters.startTime !== undefined) {
+        where.push('ce.ts >= ?');
+        params.push(filters.startTime);
+      }
+      if (filters.endTime !== undefined) {
+        where.push('ce.ts <= ?');
+        params.push(filters.endTime);
+      }
       if (where.length) sql += ` WHERE ${where.join(' AND ')}`;
       sql += ' ORDER BY ce.ts DESC LIMIT ?';
       params.push(limit);
@@ -220,6 +238,14 @@ class SqliteStorage extends StorageAdapter {
       if (filters.status) {
         where.push('ae.status = ?');
         params.push(filters.status);
+      }
+      if (filters.startTime !== undefined) {
+        where.push('ae.ts >= ?');
+        params.push(filters.startTime);
+      }
+      if (filters.endTime !== undefined) {
+        where.push('ae.ts <= ?');
+        params.push(filters.endTime);
       }
       if (where.length) sql += ` WHERE ${where.join(' AND ')}`;
       sql += ' ORDER BY ae.ts DESC LIMIT ?';

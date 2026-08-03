@@ -45,20 +45,22 @@ class StorageAdapter {
    * Returns the most recent telemetry points for a device, newest first,
    * capped at `limit`. Used by the monitoring dashboard/API -- not on any
    * ingestion hot path.
+   * @param {object} [filters] - {startTime?, endTime?} ms epoch, inclusive bounds
    * @returns {Promise<object[]>}
    */
   // eslint-disable-next-line class-methods-use-this, no-unused-vars
-  async queryTelemetry(_deviceId, _limit) {
+  async queryTelemetry(_deviceId, _limit, _filters) {
     throw new Error('StorageAdapter.queryTelemetry() not implemented');
   }
 
   /**
    * Returns the most recent command records (one per commandId, latest
    * known status), newest first, capped at `limit`.
+   * @param {object} [filters] - {deviceId?, status?, startTime?, endTime?}
    * @returns {Promise<object[]>}
    */
   // eslint-disable-next-line class-methods-use-this, no-unused-vars
-  async queryCommandHistory(_limit) {
+  async queryCommandHistory(_limit, _filters) {
     throw new Error('StorageAdapter.queryCommandHistory() not implemented');
   }
 
@@ -74,10 +76,11 @@ class StorageAdapter {
   /**
    * Returns the most recent alarm records (one per alarmId, latest known
    * state), newest first, capped at `limit`.
+   * @param {object} [filters] - {deviceId?, status?, startTime?, endTime?}
    * @returns {Promise<object[]>}
    */
   // eslint-disable-next-line class-methods-use-this, no-unused-vars
-  async queryAlarmHistory(_limit) {
+  async queryAlarmHistory(_limit, _filters) {
     throw new Error('StorageAdapter.queryAlarmHistory() not implemented');
   }
 

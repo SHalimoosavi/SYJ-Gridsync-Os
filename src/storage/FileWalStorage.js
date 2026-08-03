@@ -120,7 +120,7 @@ class FileWalStorage extends StorageAdapter {
     return Object.values(latest).filter((r) => r.status !== 'ACKED' && r.status !== 'FAILED');
   }
 
-  async queryTelemetry(deviceId, limit) {
+  async queryTelemetry(deviceId, limit, filters = {}) {
     assertNonEmptyString(deviceId, 'deviceId');
     let content;
     try {
@@ -129,7 +129,7 @@ class FileWalStorage extends StorageAdapter {
       if (err.code === 'ENOENT') return [];
       throw new StorageError('Failed to read telemetry log', { cause: err.message });
     }
-    const matches = [];
+    let matches = [];
     for (const line of content.split('\n')) {
       if (!line.trim()) continue;
       try {
@@ -140,6 +140,7 @@ class FileWalStorage extends StorageAdapter {
         if (this.logger) this.logger.warn('skipping corrupt telemetry line during query');
       }
     }
+    matches = this._filterByTimeRange(matches, (p) => p.timestamp, filters);
     // Sort by timestamp explicitly rather than trusting file-append order
     // to equal chronological order -- concurrent writes for the same
     // device are not guaranteed to land in temporal order (see the
@@ -154,6 +155,7 @@ class FileWalStorage extends StorageAdapter {
     let all = Object.values(latest);
     if (filters.deviceId) all = all.filter((r) => r.deviceId === filters.deviceId);
     if (filters.status) all = all.filter((r) => r.status === filters.status);
+    all = this._filterByTimeRange(all, (r) => r.ts || 0, filters);
     all.sort((a, b) => (b.ts || 0) - (a.ts || 0));
     return all.slice(0, limit);
   }
@@ -163,8 +165,25 @@ class FileWalStorage extends StorageAdapter {
     let all = Object.values(latest);
     if (filters.deviceId) all = all.filter((r) => r.deviceId === filters.deviceId);
     if (filters.status) all = all.filter((r) => r.status === filters.status);
+    all = this._filterByTimeRange(all, (r) => r.ts || 0, filters);
     all.sort((a, b) => (b.ts || 0) - (a.ts || 0));
     return all.slice(0, limit);
+  }
+
+  /**
+   * Filters `items` to those whose timestamp (via `getTimestamp`) falls
+   * within [startTime, endTime] inclusive. Either bound may be omitted.
+   * No-ops (returns `items` unchanged) if neither bound is present, to
+   * avoid an unnecessary array copy on the (default) unfiltered path.
+   */
+  _filterByTimeRange(items, getTimestamp, { startTime, endTime } = {}) {
+    if (startTime === undefined && endTime === undefined) return items;
+    return items.filter((item) => {
+      const ts = getTimestamp(item);
+      if (startTime !== undefined && ts < startTime) return false;
+      if (endTime !== undefined && ts > endTime) return false;
+      return true;
+    });
   }
 
   /** Reads an id-keyed WAL file and returns the latest record per id ("later line wins"). */

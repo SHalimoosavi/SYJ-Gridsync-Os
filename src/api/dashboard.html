@@ -263,6 +263,16 @@
             <label for="focusDevice">Device</label>
             <select id="focusDevice"><option value="">— select a device —</option></select>
           </div>
+          <div class="form-field" style="flex: 0 0 160px;">
+            <label for="rangeSelect">Time Range</label>
+            <select id="rangeSelect">
+              <option value="">All (most recent)</option>
+              <option value="hour">Last Hour</option>
+              <option value="day">Last Day</option>
+              <option value="week">Last Week</option>
+              <option value="month">Last Month</option>
+            </select>
+          </div>
         </div>
 
         <div class="charts-grid" style="margin-top: 10px;">
@@ -382,6 +392,12 @@
   const loginError = document.getElementById('loginError');
   const confirmModal = document.getElementById('confirmModal');
   const focusDeviceSelect = document.getElementById('focusDevice');
+  const rangeSelect = document.getElementById('rangeSelect');
+
+  function rangeQueryParam() {
+    const range = rangeSelect.value;
+    return range ? '&range=' + encodeURIComponent(range) : '';
+  }
   let refreshTimer = null;
   let currentRole = null;
   let knownDeviceIds = [];
@@ -734,6 +750,13 @@
       '<span>' + max.toFixed(digits) + '</span></div>';
   }
 
+  function chartLimitForRange() {
+    const range = rangeSelect.value;
+    if (range === 'week' || range === 'month') return 500; // wider window -- use the max cap for better coverage
+    if (range === 'day') return 150;
+    return 30; // 'hour' or unfiltered (most recent)
+  }
+
   async function refreshCharts() {
     const deviceId = focusDeviceSelect.value;
     if (!deviceId) {
@@ -743,7 +766,7 @@
       return;
     }
     try {
-      const res = await authFetch('/api/devices/' + encodeURIComponent(deviceId) + '/telemetry?limit=30');
+      const res = await authFetch('/api/devices/' + encodeURIComponent(deviceId) + '/telemetry?limit=' + chartLimitForRange() + rangeQueryParam());
       if (!res.ok) return;
       const body = await res.json();
       const chronological = body.points.slice().reverse(); // API returns newest-first
@@ -761,6 +784,7 @@
   }
 
   focusDeviceSelect.addEventListener('change', refreshCharts);
+  rangeSelect.addEventListener('change', function () { refreshCharts(); refresh(); });
 
   // ---- Alarms ----
   function renderAlarms(alarms) {
@@ -827,7 +851,7 @@
       const [snapshotRes, devicesRes, historyRes, alarmsRes] = await Promise.all([
         authFetch('/api/snapshot'),
         authFetch('/api/devices'),
-        authFetch('/api/commands/history?limit=25'),
+        authFetch('/api/commands/history?limit=25' + rangeQueryParam()),
         authFetch('/api/alarms/active'),
       ]);
 
